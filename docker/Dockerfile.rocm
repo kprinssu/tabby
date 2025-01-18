@@ -1,6 +1,6 @@
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION=24.04
 # This needs to generally match the container host's environment.
-ARG ROCM_VERSION=5.7.1
+ARG ROCM_VERSION=6.3.1
 # Target the ROCM build image
 ARG BASE_ROCM_DEV_CONTAINER=rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}-complete
 # Target the ROCM runtime image
@@ -57,9 +57,11 @@ RUN apt-get update && \
     rocblas \
     hipblas \
     libgomp1 \
+    libomp-dev \
     && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    ln -s /usr/lib/x86_64-linux-gnu/libomp.so.5 /usr/lib/x86_64-linux-gnu/libomp.so
 
 # Disable safe directory in docker
 # Context: https://github.com/git/git/commit/8959555cee7ec045958f9b6dd62e541affb7e7d9
