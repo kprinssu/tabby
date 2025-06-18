@@ -25,7 +25,7 @@ impl LlamaCppEngine {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct CompletionRequest {
     seed: u64,
     prompt: String,
@@ -45,7 +45,8 @@ struct CompletionResponseChunk {
 #[async_trait]
 impl CompletionStream for LlamaCppEngine {
     async fn generate(&self, prompt: &str, options: CompletionOptions) -> BoxStream<String> {
-        let request = CompletionRequest {
+        // Always use streaming mode in generate method
+        let request_body = CompletionRequest {
             seed: options.seed,
             prompt: prompt.to_owned(),
             n_predict: options.max_decoding_tokens,
@@ -55,7 +56,7 @@ impl CompletionStream for LlamaCppEngine {
             presence_penalty: options.presence_penalty,
         };
 
-        let mut request = self.client.post(&self.api_endpoint).json(&request);
+        let mut request = self.client.post(&self.api_endpoint).json(&request_body);
         if let Some(api_key) = &self.api_key {
             request = request.bearer_auth(api_key);
         }

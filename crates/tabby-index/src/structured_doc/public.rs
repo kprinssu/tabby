@@ -1,15 +1,21 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
+use anyhow::Result;
 use async_stream::stream;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tabby_common::index::{corpus, structured_doc::fields as StructuredDocIndexFields};
 use tabby_inference::Embedding;
+use tracing::debug;
 
 pub use super::types::{
+    commit::CommitDocument as StructuredDocCommitFields,
+    ingested::IngestedDocument as StructuredDocIngestedFields,
     issue::IssueDocument as StructuredDocIssueFields,
+    page::PageDocument as StructuredDocPageFields,
     pull::PullDocument as StructuredDocPullDocumentFields,
-    web::WebDocument as StructuredDocWebFields, StructuredDoc, StructuredDocFields,
+    web::WebDocument as StructuredDocWebFields, StructuredDoc, StructuredDocFields, KIND_COMMIT,
+    KIND_INGESTED,
 };
 use super::{create_structured_doc_builder, types::BuildStructuredDoc};
 use crate::{indexer::TantivyDocBuilder, Indexer};
@@ -68,7 +74,7 @@ impl StructuredDocIndexer {
     // If the document is marked as deleted, it will be removed.
     // Next, the document is rebuilt, the original is deleted, and the newly indexed document is added.
     pub async fn sync(&self, document: StructuredDoc) -> bool {
-        if !self.require_updates(&document) {
+        if !self.require_updates(&document).await {
             return false;
         }
 
@@ -94,17 +100,47 @@ impl StructuredDocIndexer {
         }
     }
 
+    pub async fn count_doc(&self, source_id: &str, kind: &str) -> Result<usize> {
+        let attributes = vec![(StructuredDocIndexFields::KIND, kind)];
+        self.indexer
+            .count_doc_by_attribute(source_id, &attributes)
+            .await
+    }
+
+    pub async fn list_latest_ids(
+        &self,
+        source_id: &str,
+        kind: &str,
+        datetime_field: &str,
+        offset: usize,
+    ) -> Result<Vec<String>> {
+        self.indexer
+            .list_latest_ids(
+                source_id,
+                &vec![(StructuredDocIndexFields::KIND, kind)],
+                datetime_field,
+                offset,
+            )
+            .await
+    }
+
     pub fn commit(self) {
         self.indexer.commit();
     }
 
-    fn require_updates(&self, document: &StructuredDoc) -> bool {
+    async fn require_updates(&self, document: &StructuredDoc) -> bool {
         if document.should_skip() {
             return false;
         }
 
         if self.should_backfill(document) {
             return true;
+        }
+
+        if let StructuredDocFields::Commit(_commit) = &document.fields {
+            if self.indexer.get_doc(document.id()).await.is_ok() {
+                return false;
+            }
         }
 
         true
@@ -137,5 +173,57 @@ impl StructuredDocIndexer {
         }
 
         false
+    }
+}
+
+pub struct StructuredDocGarbageCollector {
+    indexer: Indexer,
+}
+
+impl Default for StructuredDocGarbageCollector {
+    fn default() -> Self {
+        Self {
+            indexer: Indexer::new(corpus::STRUCTURED_DOC),
+        }
+    }
+}
+
+impl StructuredDocGarbageCollector {
+    pub async fn run<F, Fut>(self, should_keep_ingested: F) -> anyhow::Result<()>
+    where
+        F: Fn(String, String) -> Fut + Send + Sync,
+        Fut: Future<Output = bool> + Send,
+    {
+        stream! {
+            let mut num_to_delete = 0;
+
+            for await (source_id, id) in self.indexer.iter_ids() {
+                let kind = if let Ok(Some(kind)) = self.indexer.get_doc_kind(&id).await {
+                    kind
+                } else {
+                    continue
+                };
+
+                if kind.as_str() == KIND_INGESTED {
+                    let doc_id = if let Some(doc_id) = id.strip_prefix(&format!("{}/", source_id)) {
+                        doc_id
+                    } else {
+                        debug!("ingested doc has incorrect id format, deleting, id: {}, source: {}", id, source_id);
+                        num_to_delete += 1;
+                        self.indexer.delete(&id);
+                        continue;
+                    };
+                    if !should_keep_ingested(source_id.clone(), doc_id.to_owned()).await {
+                        num_to_delete += 1;
+                        self.indexer.delete(&id);
+                    }
+                }
+            }
+
+            self.indexer.commit();
+            logkit::info!("Finished garbage collection for structured doc index: {num_to_delete} items removed");
+        }.collect::<()>().await;
+
+        Ok(())
     }
 }

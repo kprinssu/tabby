@@ -8,6 +8,7 @@ abstract class Filepath(
   sealed class Kind {
     companion object {
       const val GIT = "git"
+      const val WORKSPACE = "workspace"
       const val URI = "uri"
     }
   }
@@ -18,6 +19,11 @@ data class FilepathInGitRepository(
   val gitUrl: String,
   val revision: String? = null,
 ) : Filepath(Kind.GIT)
+
+data class FilepathInWorkspace(
+  val filepath: String,
+  val baseDir: String,
+) : Filepath(Kind.WORKSPACE)
 
 data class FilepathUri(
   val uri: String,
@@ -54,6 +60,14 @@ sealed class ChatCommand {
     const val FIX = "fix"
     const val GENERATE_DOCS = "generate-docs"
     const val GENERATE_TESTS = "generate-tests"
+    const val CODE_REVIEW = "code-review"
+  }
+}
+
+sealed class ChatView {
+  companion object {
+    const val NEW_CHAT = "new-chat"
+    const val HISTORY = "history"
   }
 }
 
@@ -75,6 +89,8 @@ fun Any.asFileLocation(): FileLocation? {
     if (filepathValue is Map<*, *> && filepathValue.containsKey("kind")) {
       if (filepathValue["kind"] == Filepath.Kind.GIT) {
         gson.fromJson(gson.toJson(filepathValue), FilepathInGitRepository::class.java)
+      } else if (filepathValue["kind"] == Filepath.Kind.WORKSPACE) {
+        gson.fromJson(gson.toJson(filepathValue), FilepathInWorkspace::class.java)
       } else if (filepathValue["kind"] == Filepath.Kind.URI) {
         gson.fromJson(gson.toJson(filepathValue), FilepathUri::class.java)
       } else {

@@ -8,6 +8,7 @@ import {
   AtSign,
   Bell,
   Blocks,
+  BookOpen,
   BookOpenText,
   Box,
   Bug,
@@ -22,7 +23,10 @@ import {
   Files,
   FileSearch2,
   FileText,
+  FileUp,
   Filter,
+  FolderUp,
+  GitCommitHorizontal,
   GitFork,
   GitMerge,
   GitPullRequest,
@@ -32,9 +36,13 @@ import {
   Layers2,
   Link,
   ListFilter,
+  ListTree,
   Mail,
+  MessageSquare,
   MessagesSquare,
+  Moon,
   PanelLeft,
+  Plus,
   Regex,
   Search,
   Share2,
@@ -42,6 +50,7 @@ import {
   SquareActivity,
   SquareChevronRight,
   Star,
+  Sun,
   Tag,
   WrapText,
   X
@@ -305,18 +314,8 @@ function IconUser({ className, ...props }: React.ComponentProps<'svg'>) {
   )
 }
 
-function IconPlus({ className, ...props }: React.ComponentProps<'svg'>) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 256 256"
-      fill="currentColor"
-      className={cn('h-4 w-4', className)}
-      {...props}
-    >
-      <path d="M224 128a8 8 0 0 1-8 8h-80v80a8 8 0 0 1-16 0v-80H40a8 8 0 0 1 0-16h80V40a8 8 0 0 1 16 0v80h80a8 8 0 0 1 8 8Z" />
-    </svg>
-  )
+function IconPlus({ className, ...props }: React.ComponentProps<typeof Plus>) {
+  return <Plus className={cn('h-4 w-4', className)} {...props} />
 }
 
 function IconArrowElbow({ className, ...props }: React.ComponentProps<'svg'>) {
@@ -417,32 +416,12 @@ function IconSidebar({ className, ...props }: React.ComponentProps<'svg'>) {
   )
 }
 
-function IconMoon({ className, ...props }: React.ComponentProps<'svg'>) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 256 256"
-      fill="currentColor"
-      className={cn('h-4 w-4', className)}
-      {...props}
-    >
-      <path d="M233.54 142.23a8 8 0 0 0-8-2 88.08 88.08 0 0 1-109.8-109.8 8 8 0 0 0-10-10 104.84 104.84 0 0 0-52.91 37A104 104 0 0 0 136 224a103.09 103.09 0 0 0 62.52-20.88 104.84 104.84 0 0 0 37-52.91 8 8 0 0 0-1.98-7.98Zm-44.64 48.11A88 88 0 0 1 65.66 67.11a89 89 0 0 1 31.4-26A106 106 0 0 0 96 56a104.11 104.11 0 0 0 104 104 106 106 0 0 0 14.92-1.06 89 89 0 0 1-26.02 31.4Z" />
-    </svg>
-  )
+function IconMoon({ className, ...props }: React.ComponentProps<typeof Moon>) {
+  return <Moon className={cn('h-4 w-4', className)} {...props} />
 }
 
-function IconSun({ className, ...props }: React.ComponentProps<'svg'>) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 256 256"
-      fill="currentColor"
-      className={cn('h-4 w-4', className)}
-      {...props}
-    >
-      <path d="M120 40V16a8 8 0 0 1 16 0v24a8 8 0 0 1-16 0Zm72 88a64 64 0 1 1-64-64 64.07 64.07 0 0 1 64 64Zm-16 0a48 48 0 1 0-48 48 48.05 48.05 0 0 0 48-48ZM58.34 69.66a8 8 0 0 0 11.32-11.32l-16-16a8 8 0 0 0-11.32 11.32Zm0 116.68-16 16a8 8 0 0 0 11.32 11.32l16-16a8 8 0 0 0-11.32-11.32ZM192 72a8 8 0 0 0 5.66-2.34l16-16a8 8 0 0 0-11.32-11.32l-16 16A8 8 0 0 0 192 72Zm5.66 114.34a8 8 0 0 0-11.32 11.32l16 16a8 8 0 0 0 11.32-11.32ZM48 128a8 8 0 0 0-8-8H16a8 8 0 0 0 0 16h24a8 8 0 0 0 8-8Zm80 80a8 8 0 0 0-8 8v24a8 8 0 0 0 16 0v-24a8 8 0 0 0-8-8Zm112-88h-24a8 8 0 0 0 0 16h24a8 8 0 0 0 0-16Z" />
-    </svg>
-  )
+function IconSun({ className, ...props }: React.ComponentProps<typeof Sun>) {
+  return <Sun className={cn('h-4 w-4', className)} {...props} />
 }
 
 function IconCopy({ className, ...props }: React.ComponentProps<'svg'>) {
@@ -872,6 +851,7 @@ function IconCode({ className, ...props }: React.ComponentProps<'svg'>) {
         fill="currentColor"
         fillRule="evenodd"
         clipRule="evenodd"
+        strokeWidth={2}
       ></path>
     </svg>
   )
@@ -1608,18 +1588,26 @@ function Emoji({
   )
 }
 
-function IconEmojiBook({ className, ...props }: React.ComponentProps<'span'>) {
+function IconEmojiBook({
+  className,
+  emojiClassName,
+  ...props
+}: React.ComponentProps<'span'> & { emojiClassName?: string }) {
   return (
     <span className={cn('h-4 w-4 pt-0.5', className)} {...props}>
-      <Emoji emoji="📚" />
+      <Emoji emoji="📚" className={emojiClassName} />
     </span>
   )
 }
 
-function IconEmojiGlobe({ className, ...props }: React.ComponentProps<'span'>) {
+function IconEmojiGlobe({
+  className,
+  emojiClassName,
+  ...props
+}: React.ComponentProps<'span'> & { emojiClassName?: string }) {
   return (
     <span className={cn('h-4 w-4', className)} {...props}>
-      <Emoji emoji="🌐" />
+      <Emoji emoji="🌐" className={emojiClassName} />
     </span>
   )
 }
@@ -1647,6 +1635,13 @@ function IconFiles({
   ...props
 }: React.ComponentProps<typeof MessagesSquare>) {
   return <Files className={cn('h-4 w-4', className)} {...props} />
+}
+
+function IconMessageSquare({
+  className,
+  ...props
+}: React.ComponentProps<typeof MessageSquare>) {
+  return <MessageSquare className={cn('h-4 w-4', className)} {...props} />
 }
 
 function IconRegex({
@@ -1718,6 +1713,13 @@ function IconCircleDot({
   return <CircleDot className={cn('h-4 w-4', className)} {...props} />
 }
 
+function IconGitCommit({
+  className,
+  ...props
+}: React.ComponentProps<typeof GitCommitHorizontal>) {
+  return <GitCommitHorizontal className={cn('h-4 w-4', className)} {...props} />
+}
+
 function IconGitPullRequest({
   className,
   ...props
@@ -1748,6 +1750,53 @@ function IconFileSearch2({
 
 function IconBell({ className, ...props }: React.ComponentProps<typeof Bell>) {
   return <Bell className={cn('h-4 w-4', className)} {...props} />
+}
+
+function IconListTree({
+  className,
+  ...props
+}: React.ComponentProps<typeof ListTree>) {
+  return <ListTree className={cn('h-4 w-4', className)} {...props} />
+}
+
+function IconBookOpen({
+  className,
+  ...props
+}: React.ComponentProps<typeof BookOpen>) {
+  return <BookOpen className={cn('h-4 w-4', className)} {...props} />
+}
+
+function IconCheckFull({ className, ...props }: React.ComponentProps<'svg'>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      className={cn('h-4 w-4', className)}
+      {...props}
+    >
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M22 12C22 17.5228 17.5228 22 12 22C6.47715 22 2 17.5228 2 12C2 6.47715 6.47715 2 12 2C17.5228 2 22 6.47715 22 12ZM16.0303 8.96967C16.3232 9.26256 16.3232 9.73744 16.0303 10.0303L11.0303 15.0303C10.7374 15.3232 10.2626 15.3232 9.96967 15.0303L7.96967 13.0303C7.67678 12.7374 7.67678 12.2626 7.96967 11.9697C8.26256 11.6768 8.73744 11.6768 9.03033 11.9697L10.5 13.4393L12.7348 11.2045L14.9697 8.96967C15.2626 8.67678 15.7374 8.67678 16.0303 8.96967Z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+function IconFolderUp({
+  className,
+  ...props
+}: React.ComponentProps<typeof FolderUp>) {
+  return <FolderUp className={cn('h-4 w-4', className)} {...props} />
+}
+
+function IconFileUp({
+  className,
+  ...props
+}: React.ComponentProps<typeof FileUp>) {
+  return <FileUp className={cn('h-4 w-4', className)} {...props} />
 }
 
 export {
@@ -1859,9 +1908,16 @@ export {
   IconEye,
   IconEyeOff,
   IconCircleDot,
+  IconGitCommit,
   IconGitPullRequest,
   IconGitMerge,
   IconSquareChevronRight,
   IconFileSearch2,
-  IconBell
+  IconBell,
+  IconListTree,
+  IconCheckFull,
+  IconBookOpen,
+  IconMessageSquare,
+  IconFolderUp,
+  IconFileUp
 }

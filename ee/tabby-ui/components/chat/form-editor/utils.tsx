@@ -1,23 +1,57 @@
 // utils.ts
-import { JSONContent } from '@tiptap/core'
-import { Filepath } from 'tabby-chat-panel/index'
+import { Editor, JSONContent } from '@tiptap/core'
+import { FileBox, SquareFunction } from 'lucide-react'
+import { Filepath, ListSymbolItem } from 'tabby-chat-panel/index'
 
-import { PLACEHOLDER_FILE_REGEX } from '@/lib/constants/regex'
+import {
+  PLACEHOLDER_FILE_REGEX,
+  PLACEHOLDER_SYMBOL_REGEX
+} from '@/lib/constants/regex'
+import { ContextSource } from '@/lib/gql/generates/graphql'
 import { FileContext } from '@/lib/types'
-import { convertFilepath, resolveFileNameForDisplay } from '@/lib/utils'
+import {
+  convertFromFilepath,
+  nanoid,
+  resolveFileNameForDisplay
+} from '@/lib/utils'
+import { IconFile } from '@/components/ui/icons'
 
-import { FileItem, SourceItem } from './types'
+import { CommandItem, FileItem, SourceItem } from '../types'
 
 /**
  * Converts a FileItem to a SourceItem for use in the mention dropdown list.
  */
 export function fileItemToSourceItem(info: FileItem): SourceItem {
-  const filepathString = convertFilepath(info.filepath).filepath
-  return {
+  const filepathString = convertFromFilepath(info.filepath).filepath
+  const source: Omit<SourceItem, 'id'> = {
     fileItem: info,
     name: resolveFileNameForDisplay(filepathString), // Extract the last segment of the path as the name
     filepath: filepathString,
-    category: 'file'
+    category: 'file',
+    icon: <IconFile />
+  }
+  try {
+    return {
+      id: JSON.stringify(info.filepath),
+      ...source
+    }
+  } catch (e) {
+    return {
+      id: nanoid(),
+      ...source
+    }
+  }
+}
+
+export function symbolItemToSourceItem(info: ListSymbolItem): SourceItem {
+  const filepath = convertFromFilepath(info.filepath).filepath
+  return {
+    category: 'symbol',
+    id: info.label,
+    name: info.label,
+    filepath: filepath,
+    fileItem: info,
+    icon: <SquareFunction className="h-4 w-4" />
   }
 }
 
@@ -46,6 +80,17 @@ export function replaceAtMentionPlaceHolderWithAt(value: string) {
     }
   }
 
+  while ((match = PLACEHOLDER_SYMBOL_REGEX.exec(value)) !== null) {
+    try {
+      const symbolPlaceholder = match[1]
+      const symbolInfo = JSON.parse(symbolPlaceholder)
+      const labelName = symbolInfo.label || ''
+      newValue = newValue.replace(match[0], `@${labelName}`)
+    } catch (error) {
+      continue
+    }
+  }
+
   return newValue
 }
 
@@ -58,10 +103,25 @@ export function getFilepathStringByChatPanelFilePath(
   return 'filepath' in filepath ? filepath.filepath : filepath.uri
 }
 
-export function convertTextToTiptapContent(text: string): JSONContent[] {
+/**
+ * convert doc mention
+ * If there are dev doc mentions, convert to doc name
+ */
+export function convertTextToTiptapContent(
+  text: string,
+  sources: ContextSource[]
+): JSONContent[] {
   const nodes: JSONContent[] = []
   let lastIndex = 0
-  text.replace(PLACEHOLDER_FILE_REGEX, (match, filepath, offset) => {
+
+  // Single regex to match all placeholder types: [[type:content]]
+  const unifiedRegex = /\[\[(file|contextCommand|symbol|source):(.+?)\]\]/g
+  let match
+
+  while ((match = unifiedRegex.exec(text)) !== null) {
+    const [fullMatch, type, content] = match
+    const offset = match.index
+
     // Add text before the match as a text node
     if (offset > lastIndex) {
       nodes.push({
@@ -69,22 +129,75 @@ export function convertTextToTiptapContent(text: string): JSONContent[] {
         text: text.slice(lastIndex, offset)
       })
     }
-    try {
-      // Add mention node
-      nodes.push({
-        type: 'mention',
-        attrs: {
-          category: 'file',
-          fileItem: {
-            filepath: JSON.parse(filepath)
-          }
-        }
-      })
-    } catch (e) {}
 
-    lastIndex = offset + match.length
-    return match
-  })
+    try {
+      // Handle each placeholder type
+      switch (type) {
+        case 'file': {
+          const fileData = JSON.parse(content) as Filepath
+          const label = resolveFileNameForDisplay(
+            'uri' in fileData ? fileData.uri : fileData.filepath
+          )
+
+          nodes.push({
+            type: 'mention',
+            attrs: {
+              category: 'file',
+              fileItem: {
+                filepath: fileData
+              },
+              label
+            }
+          })
+          break
+        }
+
+        case 'symbol': {
+          const symbolData = JSON.parse(content) as ListSymbolItem
+          const label = symbolData.label || ''
+
+          nodes.push({
+            type: 'mention',
+            attrs: {
+              category: 'symbol',
+              fileItem: symbolData,
+              label
+            }
+          })
+          break
+        }
+
+        case 'contextCommand': {
+          if (content && content.trim()) {
+            nodes.push({
+              type: 'mention',
+              attrs: {
+                category: 'command',
+                command: content.trim(),
+                label: content.trim()
+              }
+            })
+          }
+          break
+        }
+
+        case 'source': {
+          const source = sources.find(x => x.sourceId === content)
+          if (source) {
+            nodes.push({
+              type: 'text',
+              text: source.sourceName
+            })
+          }
+          break
+        }
+      }
+    } catch (e) {
+      // If parsing fails, just continue
+    }
+
+    lastIndex = offset + fullMatch.length
+  }
 
   // Add remaining text as a text node
   if (lastIndex < text.length) {
@@ -111,8 +224,57 @@ export function isSameEntireFileContextFromMention(
 ) {
   return (
     fileContext1.filepath === fileContext2.filepath &&
-    fileContext1.git_url === fileContext2.git_url &&
+    fileContext1.baseDir === fileContext2.baseDir &&
+    fileContext1.gitUrl === fileContext2.gitUrl &&
     !fileContext1.range &&
     !fileContext2.range
   )
+}
+
+export const isSameFileContext = (a: FileContext, b: FileContext) => {
+  const sameBasicInfo =
+    a.filepath === b.filepath &&
+    a.baseDir === b.baseDir &&
+    a.gitUrl === b.gitUrl
+
+  if (!a.range && !b.range) return sameBasicInfo
+
+  return (
+    sameBasicInfo &&
+    a.range?.start === b.range?.start &&
+    a.range?.end === b.range?.end
+  )
+}
+
+export function getMention(editor: Editor) {
+  const currentMentions: any[] = []
+  editor.state.doc.descendants(node => {
+    if (node.type.name === 'mention') {
+      currentMentions.push(node.attrs)
+    }
+  })
+  return currentMentions
+}
+
+export function commandItemToSourceItem(info: CommandItem): SourceItem {
+  return {
+    id: info.id,
+    name: info.name,
+    category: 'command',
+    command: info.command,
+    description: info.description,
+    icon: <FileBox className="h-4 w-4" />
+  }
+}
+
+/**
+ * Creates a default "changes" command item.
+ */
+export function createChangesCommand(): CommandItem {
+  return {
+    id: 'changes',
+    name: 'changes',
+    command: 'changes',
+    description: 'Adding git diff changes into context'
+  }
 }

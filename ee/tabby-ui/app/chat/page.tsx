@@ -12,24 +12,25 @@ import remarkMath from 'remark-math'
 import {
   TABBY_CHAT_PANEL_API_VERSION,
   type ChatCommand,
+  type ChatView,
   type EditorContext,
   type ErrorMessage,
-  type FetcherOptions,
   type FileLocation,
   type InitRequest
 } from 'tabby-chat-panel'
 import { useServer } from 'tabby-chat-panel/react'
 
-import { nanoid } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { IconSpinner } from '@/components/ui/icons'
-import { Chat, ChatRef } from '@/components/chat/chat'
+import { Chat } from '@/components/chat/chat'
 import { MemoizedReactMarkdown } from '@/components/markdown'
 
 import './page.css'
 
 import { saveFetcherOptions } from '@/lib/tabby/token-management'
-import { PromptFormRef } from '@/components/chat/form-editor/types'
+import { ChatRef, PromptFormRef } from '@/components/chat/types'
+
+import { HistoryView } from './components/history-view'
 
 const convertToHSLColor = (style: string) => {
   return Color(style)
@@ -49,10 +50,11 @@ const convertToHSLColor = (style: string) => {
 export default function ChatPage() {
   const [isChatComponentLoaded, setIsChatComponentLoaded] = useState(false)
   const [isServerLoaded, setIsServerLoaded] = useState(false)
-  const [fetcherOptions, setFetcherOptions] = useState<FetcherOptions | null>(
-    null
-  )
-  const [activeChatId, setActiveChatId] = useState('')
+  const [fetcherOptions, setFetcherOptions] = useState<
+    InitRequest['fetcherOptions'] | null
+  >(null)
+  const [showHistory, setShowHistory] = useState(false)
+  const [threadId, setThreadId] = useState<string | undefined>()
   const [pendingCommand, setPendingCommand] = useState<ChatCommand>()
   const [pendingRelevantContexts, setPendingRelevantContexts] = useState<
     EditorContext[]
@@ -72,32 +74,26 @@ export default function ChatPage() {
   const isInEditor = !!client || undefined
   const useMacOSKeyboardEventHandler = useRef<boolean>()
 
-  // server feature support check
-  const [supportsOnApplyInEditorV2, setSupportsOnApplyInEditorV2] =
-    useState(false)
-  const [supportsOnLookupSymbol, setSupportsOnLookupSymbol] = useState(false)
-  const [
-    supportsReadWorkspaceGitRepoInfo,
-    setSupportsReadWorkspaceGitRepoInfo
-  ] = useState(false)
-  const [
-    supportsStoreAndFetchSessionState,
-    setSupportsStoreAndFetchSessionState
-  ] = useState(false)
-  const [supportsListFileInWorkspace, setSupportProvideFileAtInfo] =
-    useState(false)
-  const [supportsReadFileContent, setSupportsReadFileContent] = useState(false)
+  const navigateToChatView = () => {
+    setShowHistory(false)
+  }
+
+  const navigateToHistoryView = () => {
+    setShowHistory(true)
+  }
 
   const executeCommand = (command: ChatCommand) => {
     if (chatRef.current) {
+      navigateToChatView()
       chatRef.current.executeCommand(command)
     } else {
       setPendingCommand(command)
     }
   }
 
-  const addRelevantContext = (ctx: EditorContext) => {
+  const addRelevantContext = async (ctx: EditorContext) => {
     if (chatRef.current) {
+      navigateToChatView()
       chatRef.current.addRelevantContext(ctx)
     } else {
       const newPendingRelevantContexts = [...pendingRelevantContexts]
@@ -106,16 +102,32 @@ export default function ChatPage() {
     }
   }
 
-  const updateActiveSelection = (ctx: EditorContext | null) => {
+  const updateActiveSelection = async (
+    ctx: EditorContext | null | undefined
+  ) => {
     if (chatRef.current) {
-      chatRef.current.updateActiveSelection(ctx)
+      chatRef.current.updateActiveSelection(ctx ?? null)
     } else if (ctx) {
       setPendingActiveSelection(ctx)
     }
   }
 
+  const navigate = async (view: ChatView) => {
+    switch (view) {
+      case 'history':
+        navigateToHistoryView()
+        break
+      case 'new-chat':
+        chatRef.current?.newChat()
+        navigateToChatView()
+        break
+      default:
+        break
+    }
+  }
+
   const server = useServer({
-    init: (request: InitRequest) => {
+    init: async (request: InitRequest) => {
       if (chatRef.current) return
 
       // save fetcherOptions to sessionStorage
@@ -123,24 +135,24 @@ export default function ChatPage() {
         saveFetcherOptions(request.fetcherOptions)
       }
 
-      setActiveChatId(nanoid())
       setFetcherOptions(request.fetcherOptions)
       useMacOSKeyboardEventHandler.current =
         request.useMacOSKeyboardEventHandler
     },
+    getVersion: async () => {
+      return TABBY_CHAT_PANEL_API_VERSION
+    },
     executeCommand: async (command: ChatCommand) => {
       return executeCommand(command)
     },
-    showError: (errorMessage: ErrorMessage) => {
+    showError: async (errorMessage: ErrorMessage) => {
       setErrorMessage(errorMessage)
     },
-    cleanError: () => {
+    cleanError: async () => {
       setErrorMessage(null)
     },
-    addRelevantContext: (context: EditorContext) => {
-      return addRelevantContext(context)
-    },
-    updateTheme: (style, themeClass) => {
+    addRelevantContext,
+    updateTheme: async (style, themeClass) => {
       const styleWithHslValue = style
         .split(';')
         .filter((style: string) => style)
@@ -160,9 +172,8 @@ export default function ChatPage() {
       document.documentElement.className =
         themeClass + ` client client-${client}`
     },
-    updateActiveSelection: (context: EditorContext | null) => {
-      return updateActiveSelection(context)
-    }
+    updateActiveSelection,
+    navigate
   })
 
   useEffect(() => {
@@ -184,7 +195,7 @@ export default function ChatPage() {
       type: 'keydown' | 'keyup' | 'keypress',
       event: KeyboardEvent
     ) => {
-      server?.onKeyboardEvent(type, {
+      server?.onKeyboardEvent?.(type, {
         code: event.code,
         isComposing: event.isComposing,
         key: event.key,
@@ -240,38 +251,11 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (server) {
-      server?.onLoaded({
+      server?.onLoaded?.({
         apiVersion: TABBY_CHAT_PANEL_API_VERSION
       })
 
-      const checkCapabilities = async () => {
-        server
-          ?.hasCapability('onApplyInEditorV2')
-          .then(setSupportsOnApplyInEditorV2)
-        server?.hasCapability('lookupSymbol').then(setSupportsOnLookupSymbol)
-        server
-          ?.hasCapability('readWorkspaceGitRepositories')
-          .then(setSupportsReadWorkspaceGitRepoInfo)
-        server
-          ?.hasCapability('listFileInWorkspace')
-          .then(setSupportProvideFileAtInfo)
-        server
-          ?.hasCapability('readFileContent')
-          .then(setSupportsReadFileContent)
-
-        Promise.all([
-          server?.hasCapability('fetchSessionState'),
-          server?.hasCapability('storeSessionState')
-        ]).then(results => {
-          setSupportsStoreAndFetchSessionState(
-            results.every(result => !!result)
-          )
-        })
-      }
-
-      checkCapabilities().then(() => {
-        setIsServerLoaded(true)
-      })
+      setIsServerLoaded(true)
     }
   }, [server])
 
@@ -325,6 +309,10 @@ export default function ChatPage() {
 
   const getActiveEditorSelection = async () => {
     return server?.getActiveEditorSelection() ?? null
+  }
+
+  const getActiveTerminalSelection = async () => {
+    return server?.getActiveTerminalSelection?.() ?? null
   }
 
   const fetchSessionState = async () => {
@@ -384,6 +372,12 @@ export default function ChatPage() {
     )
   }
 
+  const onThreadDeleted = (id: string) => {
+    if (id === threadId) {
+      chatRef.current?.newChat()
+    }
+  }
+
   if (errorMessage) {
     return (
       <StaticContent>
@@ -429,51 +423,50 @@ export default function ChatPage() {
     )
   }
 
+  const supportsStoreAndFetchSessionState =
+    server?.storeSessionState && server?.fetchSessionState
+
   return (
     <ErrorBoundary FallbackComponent={ErrorBoundaryFallback}>
+      {showHistory && (
+        <HistoryView
+          onClose={() => setShowHistory(false)}
+          onNavigate={(id: string) => setThreadId(id)}
+          onDeleted={onThreadDeleted}
+        />
+      )}
       <Chat
-        chatId={activeChatId}
-        key={activeChatId}
+        threadId={threadId}
+        setThreadId={setThreadId}
         ref={chatRef}
         chatInputRef={chatInputRef}
         onLoaded={onChatLoaded}
-        maxWidth={client === 'vscode' ? '5xl' : undefined}
+        setShowHistory={setShowHistory}
         onCopyContent={isInEditor && server?.onCopy}
         onApplyInEditor={
           isInEditor &&
-          (supportsOnApplyInEditorV2
+          (server?.onApplyInEditorV2
             ? server?.onApplyInEditorV2
             : server?.onApplyInEditor)
         }
-        supportsOnApplyInEditorV2={supportsOnApplyInEditorV2}
-        onLookupSymbol={
-          isInEditor &&
-          (supportsOnLookupSymbol ? server?.lookupSymbol : undefined)
-        }
+        supportsOnApplyInEditorV2={!!server?.onApplyInEditorV2}
+        onLookupSymbol={isInEditor && server?.lookupSymbol}
         openInEditor={openInEditor}
         openExternal={openExternal}
-        readWorkspaceGitRepositories={
-          supportsReadWorkspaceGitRepoInfo
-            ? server?.readWorkspaceGitRepositories
-            : undefined
-        }
+        readWorkspaceGitRepositories={server?.readWorkspaceGitRepositories}
         getActiveEditorSelection={getActiveEditorSelection}
+        getActiveTerminalSelection={getActiveTerminalSelection}
         fetchSessionState={
           supportsStoreAndFetchSessionState ? fetchSessionState : undefined
         }
         storeSessionState={
           supportsStoreAndFetchSessionState ? storeSessionState : undefined
         }
-        listFileInWorkspace={
-          isInEditor && supportsListFileInWorkspace
-            ? server?.listFileInWorkspace
-            : undefined
-        }
-        readFileContent={
-          isInEditor && supportsReadFileContent
-            ? server?.readFileContent
-            : undefined
-        }
+        listFileInWorkspace={isInEditor && server?.listFileInWorkspace}
+        readFileContent={isInEditor && server?.readFileContent}
+        listSymbols={isInEditor && server?.listSymbols}
+        runShell={isInEditor && server?.runShell}
+        getChanges={isInEditor && server?.getChanges}
       />
     </ErrorBoundary>
   )

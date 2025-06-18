@@ -16,18 +16,20 @@ import {
 import os from "os";
 import path from "path";
 import { StatusIssuesName } from "tabby-agent";
-import { Client } from "../lsp/Client";
+import { Client } from "../lsp/client";
 import { Config } from "../Config";
 import { ContextVariables } from "../ContextVariables";
 import { InlineCompletionProvider } from "../InlineCompletionProvider";
 import { ChatSidePanelProvider } from "../chat/sidePanel";
 import { createChatPanel } from "../chat/chatPanel";
-import { getFileContextFromSelection, getFileContext } from "../chat/fileContext";
+import { getEditorContext } from "../chat/context";
 import { GitProvider, Repository } from "../git/GitProvider";
 import { showOutputPanel } from "../logger";
 import { InlineEditController } from "../inline-edit";
 import { CommandPalette } from "./commandPalette";
 import { ConnectToServerWidget } from "./connectToServer";
+import { BranchQuickPick } from "./branchQuickPick";
+import { getTerminalContext } from "../terminal";
 
 export class Commands {
   private chatEditCancellationTokenSource: CancellationTokenSource | null = null;
@@ -169,6 +171,21 @@ export class Commands {
       const commandPalette = new CommandPalette(this.client, this.config);
       commandPalette.show();
     },
+    toggleLanguageInlineCompletion: async (languageId?: string) => {
+      if (!languageId) {
+        languageId = window.activeTextEditor?.document.languageId;
+        if (!languageId) {
+          return;
+        }
+      }
+      const isLanguageDisabled = this.config.disabledLanguages.includes(languageId);
+      const disabledLanguages = this.config.disabledLanguages;
+      if (isLanguageDisabled) {
+        await this.config.updateDisabledLanguages(disabledLanguages.filter((lang) => lang !== languageId));
+      } else {
+        await this.config.updateDisabledLanguages([...disabledLanguages, languageId]);
+      }
+    },
     "outputPanel.focus": () => {
       showOutputPanel();
     },
@@ -221,15 +238,15 @@ export class Commands {
       // When invoked from code-action/quick-fix, it contains the error message provided by the IDE
       ensureHasEditorSelection(async () => {
         await commands.executeCommand("tabby.chatView.focus");
-        this.chatSidePanelProvider.executeCommand("explain");
+        this.chatSidePanelProvider.chatWebview.executeCommand("explain");
       });
     },
     "chat.addRelevantContext": async () => {
       ensureHasEditorSelection(async (editor) => {
         await commands.executeCommand("tabby.chatView.focus");
-        const fileContext = await getFileContextFromSelection(editor, this.gitProvider);
+        const fileContext = await getEditorContext(editor, this.gitProvider, "selection");
         if (fileContext) {
-          this.chatSidePanelProvider.addRelevantContext(fileContext);
+          this.chatSidePanelProvider.chatWebview.addRelevantContext(fileContext);
         }
       });
     },
@@ -237,9 +254,9 @@ export class Commands {
       const editor = window.activeTextEditor;
       if (editor) {
         await commands.executeCommand("tabby.chatView.focus");
-        const fileContext = await getFileContext(editor, this.gitProvider);
+        const fileContext = await getEditorContext(editor, this.gitProvider, "file");
         if (fileContext) {
-          this.chatSidePanelProvider.addRelevantContext(fileContext);
+          this.chatSidePanelProvider.chatWebview.addRelevantContext(fileContext);
         }
       } else {
         window.showInformationMessage("No active editor.");
@@ -248,66 +265,81 @@ export class Commands {
     "chat.fixCodeBlock": async () => {
       ensureHasEditorSelection(async () => {
         await commands.executeCommand("tabby.chatView.focus");
-        this.chatSidePanelProvider.executeCommand("fix");
+        this.chatSidePanelProvider.chatWebview.executeCommand("fix");
       });
     },
     "chat.generateCodeBlockDoc": async () => {
       ensureHasEditorSelection(async () => {
         await commands.executeCommand("tabby.chatView.focus");
-        this.chatSidePanelProvider.executeCommand("generate-docs");
+        this.chatSidePanelProvider.chatWebview.executeCommand("generate-docs");
       });
     },
     "chat.generateCodeBlockTest": async () => {
       ensureHasEditorSelection(async () => {
         await commands.executeCommand("tabby.chatView.focus");
-        this.chatSidePanelProvider.executeCommand("generate-tests");
+        this.chatSidePanelProvider.chatWebview.executeCommand("generate-tests");
+      });
+    },
+    "chat.codeReviewCodeBlock": async () => {
+      ensureHasEditorSelection(async () => {
+        await commands.executeCommand("tabby.chatView.focus");
+        this.chatSidePanelProvider.chatWebview.executeCommand("code-review");
       });
     },
     "chat.createPanel": async () => {
       await createChatPanel(this.context, this.client, this.gitProvider);
     },
-    "chat.edit.start": async (userCommand?: string, range?: Range) => {
-      const editor = window.activeTextEditor;
+    "chat.navigate.newChat": async () => {
+      this.chatSidePanelProvider.chatWebview.navigate("new-chat");
+    },
+    "chat.navigate.history": async () => {
+      this.chatSidePanelProvider.chatWebview.navigate("history");
+    },
+    "chat.edit.start": async (
+      fileUri?: string | undefined,
+      range?: Range | undefined,
+      userCommand?: string | undefined,
+    ) => {
+      if (this.contextVariables.chatEditInProgress) {
+        window.setStatusBarMessage("Edit is already in progress.", 3000);
+        return;
+      }
+
+      let editor: TextEditor | undefined;
+      if (fileUri) {
+        try {
+          const uri = Uri.parse(fileUri, true);
+          editor = window.visibleTextEditors.find((editor) => editor.document.uri.toString() === uri.toString());
+        } catch {
+          // ignore
+        }
+      }
+      if (!editor) {
+        editor = window.activeTextEditor;
+      }
       if (!editor) {
         return;
       }
 
-      const editRange = range || editor.selection;
-
-      const editLocation = {
-        uri: editor.document.uri.toString(),
-        range: {
-          start: { line: editRange.start.line, character: 0 },
-          end: {
-            line: editRange.end.character === 0 ? editRange.end.line : editRange.end.line + 1,
-            character: 0,
-          },
-        },
-      };
-
-      if (userCommand) {
-        try {
-          // when invoke from editor context menu, the first param `userCommand` is the current file path, we reset userCommand to undefined.
-          // uri parse will throw error when no scheme can be parsed.
-          Uri.parse(userCommand, true);
-          userCommand = undefined;
-        } catch {
-          //
-        }
-      }
+      const editRange = range ?? editor.selection;
 
       const inlineEditController = new InlineEditController(
         this.client,
         this.config,
         this.contextVariables,
         editor,
-        editLocation,
-        userCommand,
+        editRange,
       );
-      inlineEditController.start();
+      const cancellationTokenSource = new CancellationTokenSource();
+      this.chatEditCancellationTokenSource = cancellationTokenSource;
+      await inlineEditController.start(userCommand, cancellationTokenSource.token);
+      cancellationTokenSource.dispose();
+      this.chatEditCancellationTokenSource = null;
     },
     "chat.edit.stop": async () => {
       this.chatEditCancellationTokenSource?.cancel();
+      this.chatEditCancellationTokenSource?.dispose();
+      this.chatEditCancellationTokenSource = null;
     },
     "chat.edit.accept": async () => {
       const editor = window.activeTextEditor;
@@ -337,8 +369,11 @@ export class Commands {
       };
       await this.client.chat.resolveEdit({ location, action: "discard" });
     },
-    "chat.generateCommitMessage": async (repository?: Repository) => {
-      let selectedRepo = repository;
+    "chat.generateCommitMessage": async (repository?: { rootUri?: Uri }) => {
+      let selectedRepo: Repository | undefined = undefined;
+      if (repository && repository.rootUri) {
+        selectedRepo = this.gitProvider.getRepository(repository.rootUri);
+      }
       if (!selectedRepo) {
         const repos = this.gitProvider.getRepositories() ?? [];
         if (repos.length < 1) {
@@ -391,11 +426,91 @@ export class Commands {
             { repository: selectedRepo.rootUri.toString() },
             token,
           );
+
           if (result && selectedRepo.inputBox) {
             selectedRepo.inputBox.value = result.commitMessage;
+
+            if (selectedRepo.state.HEAD) {
+              const currentBranch = selectedRepo.state.HEAD.name;
+              // FIXME(Sma1lboy): let LLM model decide should we create a new branch or not
+              if (currentBranch === "main" || currentBranch === "master") {
+                commands.executeCommand("tabby.chat.generateBranchName", selectedRepo);
+              }
+            }
           }
         },
       );
+    },
+    "chat.generateBranchName": async (repository?: { rootUri?: Uri }) => {
+      let selectedRepo: Repository | undefined = undefined;
+      if (repository && repository.rootUri) {
+        selectedRepo = this.gitProvider.getRepository(repository.rootUri);
+      }
+      if (!selectedRepo) {
+        const repos = this.gitProvider.getRepositories() ?? [];
+        if (repos.length < 1) {
+          window.showInformationMessage("No Git repositories found.");
+          return;
+        }
+        if (repos.length == 1) {
+          selectedRepo = repos[0];
+        } else {
+          const selected = await window.showQuickPick(
+            repos
+              .map((repo) => {
+                const repoRoot = repo.rootUri.fsPath;
+                return {
+                  label: path.basename(repoRoot),
+                  detail: repoRoot,
+                  iconPath: new ThemeIcon("repo"),
+                  picked: repo.ui.selected,
+                  alwaysShow: true,
+                  value: repo,
+                };
+              })
+              .sort((a, b) => {
+                if (a.detail.startsWith(b.detail)) {
+                  return 1;
+                } else if (b.detail.startsWith(a.detail)) {
+                  return -1;
+                } else {
+                  return a.label.localeCompare(b.label);
+                }
+              }),
+            { placeHolder: "Select a Git repository" },
+          );
+          selectedRepo = selected?.value;
+        }
+      }
+      if (!selectedRepo) {
+        return;
+      }
+
+      const branchQuickPick = new BranchQuickPick(this.client, selectedRepo.rootUri.toString());
+
+      const branchName = await branchQuickPick.start();
+      if (branchName) {
+        try {
+          await selectedRepo.createBranch(branchName, true);
+          window.showInformationMessage(`Created branch: ${branchName}`);
+        } catch (error) {
+          window.showErrorMessage(`Failed to create branch: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    },
+    "terminal.explainSelection": async () => {
+      await commands.executeCommand("tabby.chatView.focus");
+      this.chatSidePanelProvider.chatWebview.executeCommand("explain-terminal");
+    },
+    "terminal.addSelectionToChat": async () => {
+      const terminalContext = await getTerminalContext();
+      if (!terminalContext) {
+        window.showInformationMessage("No terminal selection found.");
+        return;
+      }
+
+      await commands.executeCommand("tabby.chatView.focus");
+      this.chatSidePanelProvider.chatWebview.addRelevantContext(terminalContext);
     },
   };
 }
@@ -415,16 +530,18 @@ async function applyQuickFixes(uri: Uri, range: Range): Promise<void> {
     (action) =>
       action.kind && action.kind.contains(CodeActionKind.QuickFix) && action.title.toLowerCase().includes("import"),
   );
-  quickFixActions.forEach(async (action) => {
+
+  if (quickFixActions.length === 1 && quickFixActions[0]) {
+    const firstAction = quickFixActions[0];
     try {
-      if (action.edit) {
-        await workspace.applyEdit(action.edit);
+      if (firstAction.edit) {
+        await workspace.applyEdit(firstAction.edit);
       }
-      if (action.command) {
-        await commands.executeCommand(action.command.command, action.command.arguments);
+      if (firstAction.command) {
+        await commands.executeCommand(firstAction.command.command, firstAction.command.arguments);
       }
     } catch (error) {
       // ignore errors
     }
-  });
+  }
 }

@@ -13,12 +13,13 @@ import type {
 } from 'tabby-chat-panel'
 import { twMerge } from 'tailwind-merge'
 
-import { AttachmentCodeItem, AttachmentDocItem, FileContext } from '@/lib/types'
+import { AttachmentCodeItem, Context, FileContext } from '@/lib/types'
 
 import { Maybe } from '../gql/generates/graphql'
 
 export * from './chat'
 export * from './repository'
+export * from './attachment'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -170,48 +171,50 @@ export function getRangeTextFromAttachmentCode(code: AttachmentCodeItem) {
   return formatLineHashForCodeBrowser(range)
 }
 
-export function getContent(item: AttachmentDocItem) {
-  switch (item.__typename) {
-    case 'MessageAttachmentWebDoc':
-      return item.content
-    case 'MessageAttachmentIssueDoc':
-    case 'MessageAttachmentPullDoc':
-      return item.body
-  }
-
-  return ''
-}
-
 export function getPromptForChatCommand(command: ChatCommand) {
   switch (command) {
     case 'explain':
       return 'Explain the selected code:'
+    case 'explain-terminal':
+      return 'Explain the selected text in the terminal:'
     case 'fix':
       return 'Identify and fix potential bugs in the selected code:'
     case 'generate-docs':
       return 'Generate documentation for the selected code:'
     case 'generate-tests':
       return 'Generate a unit test for the selected code:'
+    case 'code-review':
+      return 'Review the selected code and provide feedback:'
   }
 }
 
-export const convertFilepath = (filepath: Filepath) => {
-  if (filepath.kind === 'uri') {
+interface FilepathConvertible {
+  filepath: string
+  baseDir?: string | undefined
+  gitUrl?: string | undefined
+  commit?: string | undefined
+}
+
+export function convertFromFilepath(filepath: Filepath): FilepathConvertible {
+  if (filepath.kind === 'git') {
     return {
-      filepath: filepath.uri,
-      git_url: ''
+      filepath: filepath.filepath,
+      gitUrl: filepath.gitUrl,
+      commit: filepath.revision
     }
   }
-
+  if (filepath.kind === 'workspace') {
+    return {
+      filepath: filepath.filepath,
+      baseDir: filepath.baseDir
+    }
+  }
   return {
-    filepath: filepath.filepath,
-    git_url: filepath.gitUrl
+    filepath: filepath.uri
   }
 }
 
-export function convertEditorContext(
-  editorContext: EditorContext
-): FileContext {
+export function convertEditorContext(editorContext: EditorContext): Context {
   const convertRange = (range: LineRange | PositionRange | undefined) => {
     // If the range is not provided, the whole file is considered.
     if (!range || typeof range.start === 'undefined') {
@@ -229,32 +232,48 @@ export function convertEditorContext(
     }
   }
 
+  if (editorContext.kind === 'terminal') {
+    return {
+      kind: 'terminal',
+      selection: editorContext.selection,
+      processId: editorContext.processId,
+      name: editorContext.name
+    }
+  }
+
   return {
     kind: 'file',
     content: editorContext.content,
     range: convertRange(editorContext.range),
-    ...convertFilepath(editorContext.filepath)
+    ...convertFromFilepath(editorContext.filepath)
   }
 }
 
-export function getFilepathFromContext(context: FileContext): Filepath {
-  if (context.git_url.length > 1 && !context.filepath.includes(':')) {
+export function convertToFilepath(context: FilepathConvertible): Filepath {
+  if (context.gitUrl && !context.filepath.includes(':')) {
     return {
       kind: 'git',
       filepath: context.filepath,
-      gitUrl: context.git_url
+      gitUrl: context.gitUrl,
+      revision: context.commit
     }
-  } else {
+  }
+  if (context.baseDir && !context.filepath.includes(':')) {
     return {
-      kind: 'uri',
-      uri: context.filepath
+      kind: 'workspace',
+      filepath: context.filepath,
+      baseDir: context.baseDir
     }
+  }
+  return {
+    kind: 'uri',
+    uri: context.filepath
   }
 }
 
 export function getFileLocationFromContext(context: FileContext): FileLocation {
   return {
-    filepath: getFilepathFromContext(context),
+    filepath: convertToFilepath(context),
     location: context.range
   }
 }
@@ -268,7 +287,9 @@ export function buildCodeBrowserUrlForContext(
 
   const searchParams = new URLSearchParams()
   searchParams.append('redirect_filepath', context.filepath)
-  searchParams.append('redirect_git_url', context.git_url)
+  if (context.gitUrl) {
+    searchParams.append('redirect_git_url', context.gitUrl)
+  }
   if (context.commit) {
     searchParams.append('redirect_rev', context.commit)
   }
@@ -278,4 +299,30 @@ export function buildCodeBrowserUrlForContext(
   url.hash = formatLineHashForCodeBrowser(context.range)
 
   return url.toString()
+}
+
+export function resolveDirectoryPath(filepath: string): string {
+  if (!filepath) return ''
+  let url: URL
+  try {
+    url = new URL(filepath)
+  } catch (e) {
+    try {
+      url = new URL(filepath, 'file://')
+    } catch (e2) {
+      return ''
+    }
+  }
+
+  try {
+    const parts = url.pathname.split('/')
+    const relevantParts = parts[0] === '' ? parts.slice(1) : parts
+    const dirPath = relevantParts.slice(0, -1).join('/')
+    if (parts[0] === '' && relevantParts.length > 1) {
+      return dirPath
+    }
+    return dirPath
+  } catch (e) {
+    return ''
+  }
 }

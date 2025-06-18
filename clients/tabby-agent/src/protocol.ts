@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/no-namespace */
 
 import {
-  ProtocolRequestType0,
   ProtocolRequestType,
   ProtocolNotificationType,
   RegistrationType,
@@ -104,15 +103,6 @@ export type ClientCapabilities = LspClientCapabilities & {
   };
   tabby?: {
     /**
-     * @deprecated Use configListener and statusListener instead.
-     * The client supports:
-     * - `tabby/agent/didUpdateServerInfo`
-     * - `tabby/agent/didChangeStatus`
-     * - `tabby/agent/didUpdateIssues`
-     * This capability indicates that client support receiving agent notifications.
-     */
-    agent?: boolean;
-    /**
      * The client supports:
      * - `tabby/config/didChange`
      * This capability indicates that client support receiving notifications for configuration changes.
@@ -167,18 +157,7 @@ export type ClientCapabilities = LspClientCapabilities & {
 };
 
 export type ServerCapabilities = LspServerCapabilities & {
-  tabby?: {
-    /**
-     * @deprecated The feature availability will be updated by dynamic registration.
-     * See {@link ChatFeatureRegistration}
-     *
-     * The server supports:
-     * - `tabby/chat/edit`
-     * - `tabby/chat/generateCommitMessage`
-     * See {@link ChatFeatureRegistration}
-     */
-    chat?: boolean;
-  };
+  tabby?: Record<string, never>;
 };
 
 export namespace ChatFeatures {
@@ -275,6 +254,7 @@ export type CodeLens = LspCodeLens & {
   data?: {
     type: CodeLensType;
     line?: ChangesPreviewLineType;
+    text?: ChangesPreviewTextType;
   };
 };
 
@@ -289,6 +269,8 @@ export type ChangesPreviewLineType =
   | "unchanged"
   | "inserted"
   | "deleted";
+
+export type ChangesPreviewTextType = "inserted" | "deleted";
 
 /**
  * Extends LSP method Completion Request(↩️)
@@ -439,7 +421,33 @@ export type ChatEditParams = {
    *    use {@link ChatEditResolveRequest} to resolve it later.
    */
   format: "previewChanges";
+
+  /**
+   * list of file contexts.
+   */
+  context?: ChatEditFileContext[];
 };
+
+/**
+ * Represents a file context use in {@link ChatEditParams}.
+ */
+export interface ChatEditFileContext {
+  /**
+   * The symbol in the user command that refer to this file context.
+   */
+  referrer: string;
+
+  /**
+   * The uri of the file.
+   */
+  uri: URI;
+
+  /**
+   * The context range in the file.
+   * If the range is not provided, the whole file is considered.
+   */
+  range?: Range;
+}
 
 export type ChatEditToken = string;
 
@@ -608,6 +616,39 @@ export type GenerateCommitMessageResult = {
 };
 
 /**
+ * [Tabby] GenerateBranchName Request(↩️)
+ *
+ * This method is sent from the client to the server to generate a branch name for a git repository.
+ * - method: `tabby/chat/generateBranchName`
+ * - params: {@link GenerateBranchNameParams}
+ * - result: {@link GenerateBranchNameResult} | null
+ * - error: {@link ChatFeatureNotAvailableError}
+ */
+export namespace GenerateBranchNameRequest {
+  export const method = "tabby/chat/generateBranchName";
+  export const messageDirection = MessageDirection.clientToServer;
+  export const type = new ProtocolRequestType<
+    GenerateBranchNameParams,
+    GenerateBranchNameResult | null,
+    void,
+    ChatFeatureNotAvailableError,
+    void
+  >(method);
+}
+
+export type GenerateBranchNameParams = {
+  /**
+   * The root URI of the git repository.
+   */
+  repository: URI;
+  input: string;
+};
+
+export type GenerateBranchNameResult = {
+  branchNames: string[];
+};
+
+/**
  * [Tabby] Telemetry Event Notification(➡️)
  *
  * This method is sent from the client to the server for telemetry purposes.
@@ -627,157 +668,6 @@ export type EventParams = {
   eventId: CompletionEventId;
   viewId?: string;
   elapsed?: number;
-};
-
-/**
- * @deprecated See {@link StatusDidChangeNotification} {@link ConfigDidChangeNotification}
- * [Tabby] DidUpdateServerInfo Notification(⬅️)
- *
- * This method is sent from the server to the client to notify the current Tabby server info has changed.
- * - method: `tabby/agent/didUpdateServerInfo`
- * - params: {@link DidUpdateServerInfoParams}
- * - result: void
- */
-export namespace AgentServerInfoSync {
-  export const method = "tabby/agent/didUpdateServerInfo";
-  export const messageDirection = MessageDirection.serverToClient;
-  export const type = new ProtocolNotificationType<DidUpdateServerInfoParams, void>(method);
-}
-
-/** @deprecated */
-export type DidUpdateServerInfoParams = {
-  serverInfo: ServerInfo;
-};
-
-/** @deprecated */
-export type ServerInfo = {
-  config: {
-    endpoint: string;
-    token: string | null;
-    requestHeaders: Record<string, string | number | boolean | null | undefined> | null;
-  };
-  health: Record<string, unknown> | null;
-};
-
-/**
- * @deprecated See {@link StatusRequest} {@link ConfigRequest}
- * [Tabby] Server Info Request(↩️)
- *
- * This method is sent from the client to the server to check the current Tabby server info.
- * - method: `tabby/agent/serverInfo`
- * - params: none
- * - result: {@link ServerInfo}
- */
-export namespace AgentServerInfoRequest {
-  export const method = "tabby/agent/serverInfo";
-  export const messageDirection = MessageDirection.clientToServer;
-  export const type = new ProtocolRequestType0<ServerInfo, never, void, void>(method);
-}
-
-/**
- * @deprecated See {@link StatusDidChangeNotification}
- * [Tabby] DidChangeStatus Notification(⬅️)
- *
- * This method is sent from the server to the client to notify the client about the status of the server.
- * - method: `tabby/agent/didChangeStatus`
- * - params: {@link DidChangeStatusParams}
- * - result: void
- */
-export namespace AgentStatusSync {
-  export const method = "tabby/agent/didChangeStatus";
-  export const messageDirection = MessageDirection.serverToClient;
-  export const type = new ProtocolNotificationType<DidChangeStatusParams, void>(method);
-}
-
-/** @deprecated */
-export type DidChangeStatusParams = {
-  status: Status;
-};
-
-/** @deprecated */
-export type Status = "notInitialized" | "ready" | "disconnected" | "unauthorized" | "finalized";
-
-/**
- * @deprecated See {@link StatusRequest}
- * [Tabby] Status Request(↩️)
- *
- * This method is sent from the client to the server to check the current status of the server.
- * - method: `tabby/agent/status`
- * - params: none
- * - result: {@link Status}
- */
-export namespace AgentStatusRequest {
-  export const method = "tabby/agent/status";
-  export const messageDirection = MessageDirection.clientToServer;
-  export const type = new ProtocolRequestType0<Status, never, void, void>(method);
-}
-
-/**
- * @deprecated See {@link StatusDidChangeNotification}
- * [Tabby] DidUpdateIssue Notification(⬅️)
- *
- * This method is sent from the server to the client to notify the client about the current issues.
- * - method: `tabby/agent/didUpdateIssues`
- * - params: {@link DidUpdateIssueParams}
- * - result: void
- */
-export namespace AgentIssuesSync {
-  export const method = "tabby/agent/didUpdateIssues";
-  export const messageDirection = MessageDirection.serverToClient;
-  export const type = new ProtocolNotificationType<DidUpdateIssueParams, void>(method);
-}
-
-/** @deprecated */
-export type DidUpdateIssueParams = IssueList;
-
-/** @deprecated */
-export type IssueList = {
-  issues: IssueName[];
-};
-
-/** @deprecated */
-export type IssueName = "slowCompletionResponseTime" | "highCompletionTimeoutRate" | "connectionFailed";
-
-/**
- * @deprecated See {@link StatusRequest}
- * [Tabby] Issues Request(↩️)
- *
- * This method is sent from the client to the server to check if there is any issue.
- * - method: `tabby/agent/issues`
- * - params: none
- * - result: {@link IssueList}
- */
-export namespace AgentIssuesRequest {
-  export const method = "tabby/agent/issues";
-  export const messageDirection = MessageDirection.clientToServer;
-  export const type = new ProtocolRequestType0<IssueList, never, void, void>(method);
-}
-
-/**
- * @deprecated See {@link StatusShowHelpMessageRequest}
- * [Tabby] Issue Detail Request(↩️)
- *
- * This method is sent from the client to the server to check the detail of an issue.
- * - method: `tabby/agent/issue/detail`
- * - params: {@link IssueDetailParams}
- * - result: {@link IssueDetailResult} | null
- */
-export namespace AgentIssueDetailRequest {
-  export const method = "tabby/agent/issue/detail";
-  export const messageDirection = MessageDirection.clientToServer;
-  export const type = new ProtocolRequestType<IssueDetailParams, IssueDetailResult | null, never, void, void>(method);
-}
-
-/** @deprecated */
-export type IssueDetailParams = {
-  name: IssueName;
-  helpMessageFormat?: "plaintext" | "markdown" | "html";
-};
-
-/** @deprecated */
-export type IssueDetailResult = {
-  name: IssueName;
-  helpMessage?: string;
 };
 
 /**
@@ -849,8 +739,9 @@ export type StatusInfo = {
     | "readyForAutoTrigger"
     | "readyForManualTrigger"
     | "fetching"
-    | "completionResponseSlow"
-    | "rateLimitExceeded";
+    | "codeCompletionNotAvailable"
+    | "rateLimitExceeded"
+    | "completionResponseSlow";
   tooltip?: string;
   /**
    * The health information of the server if available.
@@ -858,14 +749,14 @@ export type StatusInfo = {
   serverHealth?: Record<string, unknown>;
   /**
    * The action to take for this status.
-   * - `disconnected` or `completionResponseSlow` -> StatusShowHelpMessageCommand
+   * - `disconnected`, `codeCompletionNotAvailable`, `rateLimitExceeded` or `completionResponseSlow` -> StatusShowHelpMessageCommand
    * - others -> undefined
    */
   command?: StatusShowHelpMessageCommand | LspCommand;
   /**
    * The help message if available.
    * Only available when this status info is returned from {@link StatusRequest}, not provided in {@link StatusDidChangeNotification}.
-   * Only available when the status is `disconnected` or `completionResponseSlow`.
+   * Only available when the status is `disconnected`, `codeCompletionNotAvailable`, `rateLimitExceeded` or `completionResponseSlow`.
    */
   helpMessage?: string;
 };
@@ -958,47 +849,6 @@ export type ReadFileResult = {
    * If `text` is select, the result should be a string.
    */
   text?: string;
-};
-
-/**
- * @deprecated see {@link InitializationOptions} and {@link DataStoreDidUpdateNotification}
- * [Tabby] DataStore Get Request(↪️)
- *
- * This method is sent from the server to the client to get the value of the given key.
- * - method: `tabby/dataStore/get`
- * - params: {@link DataStoreGetParams}
- * - result: any
- */
-export namespace DataStoreGetRequest {
-  export const method = "tabby/dataStore/get";
-  export const messageDirection = MessageDirection.serverToClient;
-  export const type = new ProtocolRequestType<DataStoreGetParams, any, never, void, void>(method);
-}
-
-/** @deprecated */
-export type DataStoreGetParams = {
-  key: string;
-};
-
-/**
- * @deprecated see {@link DataStoreUpdateRequest}
- * [Tabby] DataStore Set Request(↪️)
- *
- * This method is sent from the server to the client to set the value of the given key.
- * - method: `tabby/dataStore/set`
- * - params: {@link DataStoreSetParams}
- * - result: boolean
- */
-export namespace DataStoreSetRequest {
-  export const method = "tabby/dataStore/set";
-  export const messageDirection = MessageDirection.serverToClient;
-  export const type = new ProtocolRequestType<DataStoreSetParams, boolean, never, void, void>(method);
-}
-
-/** @deprecated */
-export type DataStoreSetParams = {
-  key: string;
-  value: any;
 };
 
 /**

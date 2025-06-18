@@ -1,35 +1,40 @@
 'use client'
 
-import { MouseEventHandler, useContext, useMemo, useState } from 'react'
+import { useContext, useMemo, useState } from 'react'
 import { zodResolver } from '@hookform/resolvers/zod'
-import DOMPurify from 'dompurify'
-import he from 'he'
 import { compact, isEmpty } from 'lodash-es'
-import { marked } from 'marked'
 import { useForm } from 'react-hook-form'
 import Textarea from 'react-textarea-autosize'
 import * as z from 'zod'
 
 import { MARKDOWN_CITATION_REGEX } from '@/lib/constants/regex'
 import {
+  ContextSource,
+  ContextSourceKind,
   Maybe,
-  MessageAttachmentClientCode,
-  MessageAttachmentCode
+  MessageAttachmentClientCode
 } from '@/lib/gql/generates/graphql'
 import { makeFormErrorHandler } from '@/lib/tabby/gql'
 import {
-  AttachmentDocItem,
-  Context,
+  AttachmentCodeItem,
   ExtendedCombinedError,
   RelevantCodeContext
 } from '@/lib/types'
 import {
+  attachmentCodeToTerminalContext,
   buildCodeBrowserUrlForContext,
   cn,
   formatLineHashForCodeBrowser,
-  getContent,
+  getMentionsFromText,
   getRangeFromAttachmentCode,
-  getRangeTextFromAttachmentCode
+  getRangeTextFromAttachmentCode,
+  isAttachmentCommitDoc,
+  isAttachmentIngestedDoc,
+  isAttachmentIssueDoc,
+  isAttachmentPageDoc,
+  isAttachmentPullDoc,
+  isAttachmentWebDoc,
+  isDocSourceContext
 } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
@@ -40,19 +45,8 @@ import {
   FormMessage
 } from '@/components/ui/form'
 import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger
-} from '@/components/ui/hover-card'
-import {
-  IconBlocks,
   IconBug,
-  IconCheckCircled,
-  IconChevronRight,
-  IconCircleDot,
   IconEdit,
-  IconGitMerge,
-  IconGitPullRequest,
   IconLayers,
   IconPlus,
   IconRefresh,
@@ -61,42 +55,38 @@ import {
   IconTrash
 } from '@/components/ui/icons'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger
-} from '@/components/ui/tooltip'
-import { ChatContext } from '@/components/chat/chat'
-import { CodeReferences } from '@/components/chat/code-references'
+import { ChatContext } from '@/components/chat/chat-context'
 import { CopyButton } from '@/components/copy-button'
 import {
   ErrorMessageBlock,
   MessageMarkdown
 } from '@/components/message-markdown'
-import { DocDetailView } from '@/components/message-markdown/doc-detail-view'
-import { SiteFavicon } from '@/components/site-favicon'
-import { UserAvatar } from '@/components/user-avatar'
 
-import { SOURCE_CARD_STYLE } from './search'
+import { ReadingCodeStepper } from './reading-code-step'
+import { ReadingDocStepper } from './reading-doc-step'
 import { SearchContext } from './search-context'
 import { ConversationMessage } from './types'
 
 export function AssistantMessageSection({
   className,
   message,
+  userMessage,
   showRelatedQuestion,
   isLoading,
   isLastAssistantMessage,
   isDeletable,
-  clientCode
+  clientCode,
+  enableSearchPages
 }: {
   className?: string
   message: ConversationMessage
+  userMessage: ConversationMessage
   showRelatedQuestion: boolean
   isLoading?: boolean
   isLastAssistantMessage?: boolean
   isDeletable?: boolean
   clientCode?: Maybe<Array<MessageAttachmentClientCode>>
+  enableSearchPages: boolean
 }) {
   const {
     onRegenerateResponse,
@@ -111,14 +101,8 @@ export function AssistantMessageSection({
     onUpdateMessage,
     repositories
   } = useContext(SearchContext)
-
   const { supportsOnApplyInEditorV2 } = useContext(ChatContext)
-
   const [isEditing, setIsEditing] = useState(false)
-  const [showMoreSource, setShowMoreSource] = useState(false)
-  const [relevantCodeHighlightIndex, setRelevantCodeHighlightIndex] = useState<
-    number | undefined
-  >(undefined)
   const getCopyContent = (answer: ConversationMessage) => {
     if (isEmpty(answer?.attachment?.doc) && isEmpty(answer?.attachment?.code)) {
       return answer.content
@@ -132,7 +116,15 @@ export function AssistantMessageSection({
       .trim()
     const docCitations =
       answer.attachment?.doc
-        ?.map((doc, idx) => `[${idx + 1}] ${doc.link}`)
+        ?.map((doc, idx) => {
+          if (isAttachmentCommitDoc(doc)) {
+            return `[${idx + 1}] ${doc.sha}`
+          } else if (isAttachmentIngestedDoc(doc)) {
+            return `[${idx + 1}] ${doc.ingestedDocLink ?? ''}`
+          } else {
+            return `[${idx + 1}] ${doc.link}`
+          }
+        })
         .join('\n') ?? ''
     const docCitationLen = answer.attachment?.doc?.length ?? 0
     const codeCitations =
@@ -169,7 +161,7 @@ export function AssistantMessageSection({
           range: getRangeFromAttachmentCode(code),
           filepath: code.filepath || '',
           content: code.content,
-          git_url: clientCodeGitUrl
+          gitUrl: clientCodeGitUrl
         }
       }) ?? []
     )
@@ -178,12 +170,16 @@ export function AssistantMessageSection({
   const serverCodeContexts: RelevantCodeContext[] = useMemo(() => {
     return (
       message?.attachment?.code?.map(code => {
+        const terminalContext = attachmentCodeToTerminalContext(code)
+        if (terminalContext) {
+          return terminalContext
+        }
         return {
           kind: 'file',
           range: getRangeFromAttachmentCode(code),
           filepath: code.filepath,
           content: code.content,
-          git_url: code.gitUrl,
+          gitUrl: code.gitUrl,
           commit: code.commit ?? undefined,
           extra: {
             scores: code?.extra?.scores
@@ -205,29 +201,68 @@ export function AssistantMessageSection({
     (messageAttachmentClientCode?.length || 0) +
     (message.attachment?.code?.length || 0)
 
-  const totalHeightInRem = messageAttachmentDocs?.length
-    ? Math.ceil(messageAttachmentDocs.length / 4) * SOURCE_CARD_STYLE.expand +
-      0.5 * Math.floor(messageAttachmentDocs.length / 4) +
-      0.5
-    : 0
+  const codebaseDocs = useMemo(() => {
+    return messageAttachmentDocs?.filter(
+      x =>
+        isAttachmentPullDoc(x) ||
+        isAttachmentIssueDoc(x) ||
+        isAttachmentCommitDoc(x)
+    )
+  }, [messageAttachmentDocs])
 
-  const onCodeContextClick = (ctx: Context) => {
+  const webDocs = useMemo(() => {
+    return messageAttachmentDocs?.filter(
+      x => isAttachmentWebDoc(x) || isAttachmentIngestedDoc(x)
+    )
+    // return messageAttachmentDocs?.filter(x => isAttachmentWebDoc(x))
+  }, [messageAttachmentDocs])
+
+  const pages = useMemo(() => {
+    return messageAttachmentDocs?.filter(x => isAttachmentPageDoc(x))
+  }, [messageAttachmentDocs])
+
+  const docQuerySources: Array<Omit<ContextSource, 'id'>> = useMemo(() => {
+    if (!contextInfo?.sources || !userMessage?.content) return []
+
+    const _sources = getMentionsFromText(
+      userMessage.content,
+      contextInfo?.sources
+    )
+
+    const result = _sources
+      .filter(x => isDocSourceContext(x.kind))
+      .map(x => ({
+        sourceId: x.id,
+        sourceKind: x.kind,
+        sourceName: x.label
+      }))
+
+    if (enableSearchPages || pages?.length) {
+      result.unshift({
+        sourceId: 'page',
+        sourceKind: ContextSourceKind.Page,
+        sourceName: 'Pages'
+      })
+    }
+
+    return result
+  }, [
+    contextInfo?.sources,
+    userMessage?.content,
+    enableSearchPages,
+    pages?.length
+  ])
+
+  const onCodeContextClick = (ctx: RelevantCodeContext) => {
+    if (ctx.kind !== 'file') {
+      return
+    }
     if (!ctx.filepath) return
     const url = buildCodeBrowserUrlForContext(window.location.origin, ctx)
     window.open(url, '_blank')
   }
 
-  const onCodeCitationMouseEnter = (index: number) => {
-    setRelevantCodeHighlightIndex(
-      index - 1 - (message?.attachment?.doc?.length || 0)
-    )
-  }
-
-  const onCodeCitationMouseLeave = (index: number) => {
-    setRelevantCodeHighlightIndex(undefined)
-  }
-
-  const openCodeBrowserTab = (code: MessageAttachmentCode) => {
+  const openCodeBrowserTab = (code: AttachmentCodeItem) => {
     const range = getRangeFromAttachmentCode(code)
 
     if (!code.filepath) return
@@ -248,7 +283,7 @@ export function AssistantMessageSection({
     window.open(url.toString())
   }
 
-  const onCodeCitationClick = (code: MessageAttachmentCode) => {
+  const onCodeCitationClick = (code: AttachmentCodeItem) => {
     if (code.gitUrl) {
       openCodeBrowserTab(code)
     }
@@ -263,50 +298,11 @@ export function AssistantMessageSection({
     }
   }
 
+  const showReadingCodeStepper = !!message.codeSourceId
+  const showReadingDocStepper = !!docQuerySources?.length
+
   return (
     <div className={cn('flex flex-col gap-y-5', className)}>
-      {/* document search hits */}
-      {messageAttachmentDocs && messageAttachmentDocs.length > 0 && (
-        <div>
-          <div className="mb-1 flex items-center gap-x-2">
-            <IconBlocks className="relative" style={{ top: '-0.04rem' }} />
-            <p className="text-sm font-bold leading-normal">Sources</p>
-          </div>
-          <div
-            className="gap-sm -mx-2 grid grid-cols-3 gap-2 overflow-y-hidden px-2 pt-2 md:grid-cols-4"
-            style={{
-              transition: 'height 0.25s ease-out',
-              height: showMoreSource
-                ? `${totalHeightInRem}rem`
-                : `${SOURCE_CARD_STYLE.compress + 0.5}rem`
-            }}
-          >
-            {messageAttachmentDocs.map((source, index) => (
-              <SourceCard
-                key={source.link + index}
-                conversationId={message.id}
-                source={source}
-                showMore={showMoreSource}
-                showDevTooltip={enableDeveloperMode}
-              />
-            ))}
-          </div>
-          <Button
-            variant="ghost"
-            className="-ml-1.5 mt-1 flex items-center gap-x-1 px-1 py-2 text-sm font-normal text-muted-foreground"
-            onClick={() => setShowMoreSource(!showMoreSource)}
-          >
-            <IconChevronRight
-              className={cn({
-                '-rotate-90': showMoreSource,
-                'rotate-90': !showMoreSource
-              })}
-            />
-            <p>{showMoreSource ? 'Show less' : 'Show more'}</p>
-          </Button>
-        </div>
-      )}
-
       {/* Answer content */}
       <div>
         <div className="mb-1 flex h-8 items-center gap-x-1.5">
@@ -330,23 +326,36 @@ export function AssistantMessageSection({
           )}
         </div>
 
-        {/* attachment clientCode & code */}
-        {messageAttachmentCodeLen > 0 && (
-          <CodeReferences
-            clientContexts={clientCodeContexts}
-            contexts={serverCodeContexts}
-            className="mt-1 text-sm"
-            onContextClick={onCodeContextClick}
-            enableTooltip={enableDeveloperMode}
-            showExternalLink={false}
-            showClientCodeIcon
-            onTooltipClick={() => {
-              setConversationIdForDev(message.id)
-              setDevPanelOpen(true)
-            }}
-            highlightIndex={relevantCodeHighlightIndex}
-            supportsOpenInEditor={false}
-          />
+        {(showReadingCodeStepper || showReadingDocStepper) && (
+          <div className="mb-6 space-y-1.5">
+            {showReadingCodeStepper && (
+              <ReadingCodeStepper
+                clientCodeContexts={clientCodeContexts}
+                serverCodeContexts={serverCodeContexts}
+                isReadingFileList={message.isReadingFileList}
+                isReadingCode={message.isReadingCode}
+                isReadingDocs={message.isReadingDocs}
+                codeSourceId={message.codeSourceId}
+                docQuery
+                docQueryResources={docQuerySources}
+                docs={codebaseDocs}
+                codeFileList={message.attachment?.codeFileList}
+                readingCode={message.readingCode}
+                readingDoc={message.readingDoc}
+                onContextClick={onCodeContextClick}
+              />
+            )}
+            {showReadingDocStepper && (
+              <ReadingDocStepper
+                codeSourceId={message.codeSourceId}
+                docQuerySources={docQuerySources}
+                isReadingDocs={message.isReadingDocs}
+                readingDoc={message.readingDoc}
+                webDocs={webDocs}
+                pages={pages}
+              />
+            )}
+          </div>
         )}
 
         {isLoading && !message.content && (
@@ -366,12 +375,13 @@ export function AssistantMessageSection({
               attachmentClientCode={messageAttachmentClientCode}
               attachmentCode={message.attachment?.code}
               onCodeCitationClick={onCodeCitationClick}
-              onCodeCitationMouseEnter={onCodeCitationMouseEnter}
-              onCodeCitationMouseLeave={onCodeCitationMouseLeave}
               contextInfo={contextInfo}
               fetchingContextInfo={fetchingContextInfo}
-              canWrapLongLines={!isLoading}
+              isStreaming={isLoading}
               supportsOnApplyInEditorV2={supportsOnApplyInEditorV2}
+              onLinkClick={url => {
+                window.open(url)
+              }}
             />
             {/* if isEditing, do not display error message block */}
             {message.error && <ErrorMessageBlock error={message.error} />}
@@ -463,149 +473,6 @@ export function AssistantMessageSection({
   )
 }
 
-function SourceCard({
-  conversationId,
-  source,
-  showMore,
-  showDevTooltip
-}: {
-  conversationId: string
-  source: AttachmentDocItem
-  showMore: boolean
-  showDevTooltip?: boolean
-  isDeletable?: boolean
-  onDelete?: () => void
-}) {
-  const { setDevPanelOpen, setConversationIdForDev } = useContext(SearchContext)
-  const [devTooltipOpen, setDevTooltipOpen] = useState(false)
-
-  const onOpenChange = (v: boolean) => {
-    if (!showDevTooltip) return
-    setDevTooltipOpen(v)
-  }
-
-  const onTootipClick: MouseEventHandler<HTMLDivElement> = e => {
-    e.stopPropagation()
-    setConversationIdForDev(conversationId)
-    setDevPanelOpen(true)
-  }
-
-  return (
-    <HoverCard openDelay={100} closeDelay={100}>
-      <Tooltip
-        open={devTooltipOpen}
-        onOpenChange={onOpenChange}
-        delayDuration={0}
-      >
-        <HoverCardTrigger asChild>
-          <TooltipTrigger asChild>
-            <div
-              className="relative flex cursor-pointer flex-col justify-between rounded-lg border bg-card p-3 hover:bg-card/60"
-              style={{
-                height: showMore
-                  ? `${SOURCE_CARD_STYLE.expand}rem`
-                  : `${SOURCE_CARD_STYLE.compress}rem`,
-                transition: 'all 0.25s ease-out'
-              }}
-              onClick={() => window.open(source.link)}
-            >
-              <SourceCardContent source={source} showMore={showMore} />
-            </div>
-          </TooltipTrigger>
-        </HoverCardTrigger>
-        <TooltipContent
-          align="start"
-          className="cursor-pointer p-2"
-          onClick={onTootipClick}
-        >
-          <p>Score: {source?.extra?.score ?? '-'}</p>
-        </TooltipContent>
-      </Tooltip>
-      <HoverCardContent className="w-96 bg-background text-sm text-foreground dark:border-muted-foreground/60">
-        <DocDetailView relevantDocument={source} />
-      </HoverCardContent>
-    </HoverCard>
-  )
-}
-
-function SourceCardContent({
-  source,
-  showMore
-}: {
-  source: AttachmentDocItem
-  showMore: boolean
-}) {
-  const { hostname } = new URL(source.link)
-
-  const isIssue = source.__typename === 'MessageAttachmentIssueDoc'
-  const isPR = source.__typename === 'MessageAttachmentPullDoc'
-  const author =
-    source.__typename === 'MessageAttachmentWebDoc' ? undefined : source.author
-
-  const showAvatar = (isIssue || isPR) && !!author
-
-  return (
-    <div className="flex flex-1 flex-col justify-between gap-y-1">
-      <div className="flex flex-col gap-y-0.5">
-        <p className="line-clamp-1 w-full overflow-hidden text-ellipsis break-all text-xs font-semibold">
-          {source.title}
-        </p>
-
-        {showAvatar && (
-          <div className="flex items-center gap-1 overflow-x-hidden">
-            <UserAvatar user={author} className="h-3.5 w-3.5 shrink-0" />
-            <p className="truncate text-xs font-medium text-muted-foreground">
-              {author?.name}
-            </p>
-          </div>
-        )}
-        {(!showAvatar || showMore) && (
-          <p
-            className={cn(
-              ' w-full overflow-hidden text-ellipsis break-all text-xs text-muted-foreground',
-              !showAvatar && showMore ? 'line-clamp-2' : 'line-clamp-1'
-            )}
-          >
-            {normalizedText(getContent(source))}
-          </p>
-        )}
-      </div>
-      <div className="flex items-center text-xs text-muted-foreground">
-        <div className="flex w-full flex-1 items-center justify-between gap-1">
-          <div className="flex items-center">
-            <SiteFavicon hostname={hostname} />
-            <p className="ml-1 truncate">
-              {hostname.replace('www.', '').split('/')[0]}
-            </p>
-          </div>
-          <div className="flex shrink-0 items-center gap-1">
-            {isIssue && (
-              <>
-                {source.closed ? (
-                  <IconCheckCircled className="h-3.5 w-3.5" />
-                ) : (
-                  <IconCircleDot className="h-3.5 w-3.5" />
-                )}
-                <span>{source.closed ? 'Closed' : 'Open'}</span>
-              </>
-            )}
-            {isPR && (
-              <>
-                {source.merged ? (
-                  <IconGitMerge className="h-3.5 w-3.5" />
-                ) : (
-                  <IconGitPullRequest className="h-3.5 w-3.5" />
-                )}
-                {source.merged ? 'Merged' : 'Open'}
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function MessageContentForm({
   message,
   onCancel,
@@ -683,16 +550,4 @@ function MessageContentForm({
       </form>
     </Form>
   )
-}
-
-// Remove HTML and Markdown format
-const normalizedText = (input: string) => {
-  const sanitizedHtml = DOMPurify.sanitize(input, {
-    ALLOWED_TAGS: [],
-    ALLOWED_ATTR: []
-  })
-  const parsed = marked.parse(sanitizedHtml) as string
-  const decoded = he.decode(parsed)
-  const plainText = decoded.replace(/<\/?[^>]+(>|$)/g, '')
-  return plainText
 }

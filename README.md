@@ -9,6 +9,10 @@
 [![Docker pulls](https://img.shields.io/docker/pulls/tabbyml/tabby)](https://hub.docker.com/r/tabbyml/tabby)
 [![codecov](https://codecov.io/gh/TabbyML/tabby/graph/badge.svg?token=WYVVH8MKK3)](https://codecov.io/gh/TabbyML/tabby)
 
+[English](/README.md) |
+[简体中文](/README-zh.md) |
+[日本語](/README-ja.md)
+
 </div>
 
 Tabby is a self-hosted AI coding assistant, offering an open-source and on-premises alternative to GitHub Copilot. It boasts several key features:
@@ -25,10 +29,12 @@ Tabby is a self-hosted AI coding assistant, offering an open-source and on-premi
 </p>
 
 ## 🔥 What's New
-* **12/06/2024** Llamafile deployment integration and enhanced Answer Engine user experience are coming in Tabby [v0.21.0](https://github.com/TabbyML/tabby/releases/tag/v0.21.0)!🚀
-* **11/10/2024** Switching between different backend chat models is supported in Answer Engine with Tabby [v0.20.0](https://github.com/TabbyML/tabby/releases/tag/v0.20.0)!
-* **10/30/2024** Tabby [v0.19.0](https://github.com/TabbyML/tabby/releases/tag/v0.19.0) featuring recent shared threads on the main page to improve their discoverability. 
-
+* **05/25/2025** 💡Interested in joining [Agent](https://links.tabbyml.com/pochi-github-readme) private preview? DM in [X](https://x.com/getpochi) for early waitlist approval!🎫
+* **05/20/2025** Enhance Tabby with your own documentation📃 through REST APIs in [v0.29](https://github.com/TabbyML/tabby/releases/tag/v0.29.0)! 🎉 
+* **05/01/2025** [v0.28](https://github.com/TabbyML/tabby/releases/tag/v0.28.0) transforming Answer Engine messages into persistent, shareable Pages
+* **03/31/2025** [v0.27](https://github.com/TabbyML/tabby/releases/tag/v0.27.0) released with a richer `@` menu in the chat side panel.
+* **02/05/2025** LDAP Authentication and better notification for background jobs coming in Tabby [v0.24.0](https://github.com/TabbyML/tabby/releases/tag/v0.24.0)!✨
+* **02/04/2025** [VSCode 1.20.0](https://marketplace.visualstudio.com/items/TabbyML.vscode-tabby/changelog) upgrade! @-mention files to add them as chat context, and edit inline with a new right-click option are available!
 
 
 
@@ -37,6 +43,11 @@ Tabby is a self-hosted AI coding assistant, offering an open-source and on-premi
 <details>
   <summary>Archived</summary>
 
+* **01/10/2025** Tabby [v0.23.0](https://github.com/TabbyML/tabby/releases/tag/v0.23.0) featuring enhanced code browser experience and chat side panel improvements!
+* **12/24/2024** Introduce **Notification Box** in Tabby [v0.22.0](https://github.com/TabbyML/tabby/releases/tag/v0.22.0)!
+* **12/06/2024** Llamafile deployment integration and enhanced Answer Engine user experience are coming in Tabby [v0.21.0](https://github.com/TabbyML/tabby/releases/tag/v0.21.0)!🚀
+* **11/10/2024** Switching between different backend chat models is supported in Answer Engine with Tabby [v0.20.0](https://github.com/TabbyML/tabby/releases/tag/v0.20.0)!
+* **10/30/2024** Tabby [v0.19.0](https://github.com/TabbyML/tabby/releases/tag/v0.19.0) featuring recent shared threads on the main page to improve their discoverability. 
 * **07/09/2024** 🎉Announce [Codestral integration in Tabby](https://tabby.tabbyml.com/blog/2024/07/09/tabby-codestral/)!
 * **07/05/2024** Tabby [v0.13.0](https://github.com/TabbyML/tabby/releases/tag/v0.13.0) introduces ***Answer Engine***, a central knowledge engine for internal engineering teams. It seamlessly integrates with dev team's internal data, delivering reliable and precise answers to empower developers.
 * **06/13/2024** [VSCode 1.7](https://marketplace.visualstudio.com/items/TabbyML.vscode-tabby/changelog) marks a significant milestone with a versatile Chat experience throughout your coding experience. Come and they the latest **chat in side-panel** and **editing via chat command**!

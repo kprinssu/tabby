@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use juniper::ID;
 
-use crate::{policy::AccessPolicy, schema::Result};
+use crate::{auth::UserSecured, schema::Result};
 
 mod types;
 pub use types::*;
@@ -37,10 +37,20 @@ pub trait ThreadService: Send + Sync {
         last: Option<usize>,
     ) -> Result<Vec<Thread>>;
 
+    /// List threads owned by a user
+    async fn list_owned(
+        &self,
+        user_id: &ID,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<usize>,
+        last: Option<usize>,
+    ) -> Result<Vec<Thread>>;
+
     /// Create a new thread run
     async fn create_run(
         &self,
-        policy: &AccessPolicy,
+        user: &UserSecured,
         id: &ID,
         options: &ThreadRunOptionsInput,
         attachment_input: Option<&MessageAttachmentInput>,

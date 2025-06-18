@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 use futures::{stream::BoxStream, StreamExt};
 use issues::{list_github_issues, list_gitlab_issues};
 use juniper::ID;
-use pulls::{get_github_pull_doc, list_github_pull_states};
 use serde::{Deserialize, Serialize};
 use tabby_common::config::CodeRepository;
 use tabby_index::public::{CodeIndexer, StructuredDoc, StructuredDocIndexer, StructuredDocState};
@@ -15,13 +14,12 @@ use tabby_schema::{
     integration::{Integration, IntegrationKind, IntegrationService},
     job::JobService,
     repository::{ProvidedRepository, ThirdPartyRepositoryService},
-    CoreError,
 };
 use tracing::debug;
 
-use super::{helper::Job, BackgroundJobEvent};
+use super::{helper::Job, index_commits, BackgroundJobEvent};
 
-mod error;
+pub mod error;
 mod issues;
 mod pulls;
 
@@ -94,7 +92,7 @@ impl SchedulerGithubGitlabJob {
             .get_provided_repository(&self.repository_id)
             .await?;
         let integration = integration_service
-            .get_integration(repository.integration_id.clone())
+            .get_integration(&repository.integration_id)
             .await?;
 
         let authenticated_url = integration
@@ -106,12 +104,23 @@ impl SchedulerGithubGitlabJob {
             "Pulling source code for repository {}",
             repository.display_name
         );
+
+        let code_repository = CodeRepository::new(&authenticated_url, &repository.source_id());
         let mut code = CodeIndexer::default();
-        code.refresh(
-            embedding.clone(),
-            &CodeRepository::new(&authenticated_url, &repository.source_id()),
-        )
-        .await?;
+        code.refresh(embedding.clone(), &code_repository).await?;
+
+        logkit::info!(
+            "Indexing recent commits for repository {}",
+            repository.display_name
+        );
+
+        if let Err(err) = self.sync_commits(&code_repository, embedding.clone()).await {
+            integration_service
+                .update_integration_sync_status(&integration.id, Some(err.to_string()))
+                .await?;
+            logkit::error!("Failed to sync commit history: {}", err);
+            return Err(err);
+        };
 
         logkit::info!(
             "Indexing documents for repository {}",
@@ -130,6 +139,14 @@ impl SchedulerGithubGitlabJob {
             .await?;
 
         Ok(())
+    }
+
+    async fn sync_commits(
+        &self,
+        repository: &CodeRepository,
+        embedding: Arc<dyn Embedding>,
+    ) -> tabby_schema::Result<()> {
+        index_commits::refresh(embedding, repository).await
     }
 
     async fn sync_pulls(
@@ -273,18 +290,14 @@ async fn fetch_all_pull_states(
     integration: &Integration,
     repository: &ProvidedRepository,
 ) -> tabby_schema::Result<BoxStream<'static, (pulls::Pull, StructuredDocState)>> {
-    match &integration.kind {
-        IntegrationKind::Github | IntegrationKind::GithubSelfHosted => Ok(list_github_pull_states(
-            integration.api_base(),
-            &repository.display_name,
-            &integration.access_token,
-        )
-        .await?
-        .boxed()),
-        IntegrationKind::Gitlab | IntegrationKind::GitlabSelfHosted => Err(CoreError::Other(
-            anyhow::anyhow!("Gitlab does not support pull requests yet"),
-        )),
-    }
+    pulls::list_pull_states(
+        &integration.kind,
+        integration.api_base(),
+        &repository.display_name,
+        &integration.access_token,
+    )
+    .await
+    .map_err(From::from)
 }
 
 async fn fetch_pull_structured_doc(
@@ -292,16 +305,13 @@ async fn fetch_pull_structured_doc(
     repository: &ProvidedRepository,
     pull: pulls::Pull,
 ) -> Result<StructuredDoc> {
-    match pull {
-        pulls::Pull::GitHub(pull) => {
-            get_github_pull_doc(
-                &repository.source_id(),
-                pull,
-                integration.api_base(),
-                &repository.display_name,
-                &integration.access_token,
-            )
-            .await
-        }
-    }
+    pulls::get_pull_doc(
+        &repository.source_id(),
+        pull,
+        &integration.kind,
+        integration.api_base(),
+        &repository.display_name,
+        &integration.access_token,
+    )
+    .await
 }

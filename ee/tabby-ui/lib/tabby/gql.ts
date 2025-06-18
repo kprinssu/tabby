@@ -23,6 +23,8 @@ import {
   GitRepositoriesQueryVariables,
   ListIntegrationsQueryVariables,
   ListInvitationsQueryVariables,
+  ListMyThreadsQueryVariables,
+  ListPageSectionsQueryVariables,
   ListThreadsQueryVariables,
   NotificationsQueryVariables,
   SourceIdAccessPoliciesQueryVariables,
@@ -33,6 +35,8 @@ import { refreshTokenMutation } from './auth'
 import {
   listIntegrations,
   listInvitations,
+  listMyThreads,
+  listPageSections,
   listRepositories,
   listSourceIdAccessPolicies,
   listThreads,
@@ -135,7 +139,15 @@ const client = new Client({
         MessageAttachmentCode: () => null,
         MessageAttachmentDoc: () => null,
         NetworkSetting: () => null,
-        ContextInfo: () => null
+        ContextInfo: () => null,
+        PageCreated: () => null,
+        PageContentCompleted: () => null,
+        PageSectionsCreated: () => null,
+        PageSectionContentCompleted: () => null,
+        PageSectionAttachmentCode: () => null,
+        PageSectionAttachmentDoc: () => null,
+        SectionAttachment: () => null,
+        PageSectionCreated: () => null
       },
       resolvers: {
         Query: {
@@ -143,7 +155,8 @@ const client = new Client({
           gitRepositories: relayPagination(),
           webCrawlerUrls: relayPagination(),
           integrations: relayPagination(),
-          threads: relayPagination()
+          threads: relayPagination(),
+          myThreads: relayPagination()
         }
       },
       updates: {
@@ -405,6 +418,26 @@ const client = new Client({
                     }
                   )
                 })
+
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'myThreads')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listMyThreads,
+                      variables: field.arguments as ListMyThreadsQueryVariables
+                    },
+                    data => {
+                      if (data?.myThreads) {
+                        data.myThreads.edges = data.myThreads.edges.filter(
+                          e => e.node.id !== args.id
+                        )
+                      }
+                      return data
+                    }
+                  )
+                })
             }
           },
           setThreadPersisted(result, args, cache, info) {
@@ -454,6 +487,31 @@ const client = new Client({
                             return item
                           }
                         })
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          deletePageSection(result, args, cache) {
+            if (result.deletePageSection) {
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'pageSections')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listPageSections,
+                      variables:
+                        field.arguments as ListPageSectionsQueryVariables
+                    },
+                    data => {
+                      if (data?.pageSections) {
+                        data.pageSections.edges =
+                          data.pageSections.edges.filter(
+                            e => e.node.id !== args.id
+                          )
                       }
                       return data
                     }

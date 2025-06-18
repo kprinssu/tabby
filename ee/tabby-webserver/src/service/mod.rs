@@ -5,17 +5,22 @@ mod auth;
 pub mod background_job;
 pub mod context;
 mod email;
+pub mod embedding;
 pub mod event_logger;
+pub mod ingestion;
 pub mod integration;
 pub mod job;
 mod license;
 mod notification;
+mod page;
 mod preset_web_documents_data;
 pub mod repository;
+pub mod retrieval;
 mod setting;
 mod thread;
 mod user_event;
 mod user_group;
+pub mod utils;
 pub mod web_documents;
 
 use std::sync::Arc;
@@ -39,6 +44,7 @@ pub use license::new_license_service;
 pub use setting::create as new_setting_service;
 use tabby_common::{
     api::{code::CodeSearch, event::EventLogger},
+    config::PageConfig,
     constants::USER_HEADER_FIELD_NAME,
 };
 use tabby_db::{DbConn, UserDAO, UserGroupDAO};
@@ -49,12 +55,14 @@ use tabby_schema::{
     auth::{AuthenticationService, UserSecured},
     context::ContextService,
     email::EmailService,
+    ingestion::IngestionService,
     integration::IntegrationService,
     interface::UserValue,
     is_demo_mode,
     job::JobService,
     license::{IsLicenseValid, LicenseService},
     notification::NotificationService,
+    page::PageService,
     policy,
     repository::RepositoryService,
     setting::SettingService,
@@ -67,7 +75,7 @@ use tabby_schema::{
 };
 
 use self::analytic::new_analytic_service;
-use crate::rate_limit::UserRateLimiter;
+use crate::{rate_limit::UserRateLimiter, service::retrieval::RetrievalService};
 
 struct ServerContext {
     db_conn: DbConn,
@@ -81,9 +89,11 @@ struct ServerContext {
     repository: Arc<dyn RepositoryService>,
     integration: Arc<dyn IntegrationService>,
     user_event: Arc<dyn UserEventService>,
+    ingestion: Arc<dyn IngestionService>,
     job: Arc<dyn JobService>,
     web_documents: Arc<dyn WebDocumentService>,
     thread: Arc<dyn ThreadService>,
+    page: Option<Arc<dyn PageService>>,
     context: Arc<dyn ContextService>,
     user_group: Arc<dyn UserGroupService>,
     access_policy: Arc<dyn AccessPolicyService>,
@@ -105,8 +115,10 @@ impl ServerContext {
         code: Arc<dyn CodeSearch>,
         repository: Arc<dyn RepositoryService>,
         integration: Arc<dyn IntegrationService>,
+        ingestion: Arc<dyn IngestionService>,
         job: Arc<dyn JobService>,
         answer: Option<Arc<AnswerService>>,
+        retrieval: Arc<retrieval::RetrievalService>,
         context: Arc<dyn ContextService>,
         web_documents: Arc<dyn WebDocumentService>,
         mail: Arc<dyn EmailService>,
@@ -120,7 +132,23 @@ impl ServerContext {
             db_conn.clone(),
             answer.clone(),
             Some(auth.clone()),
+            context.clone(),
         ));
+        let page = chat.as_ref().and_then(|chat| {
+            answer.as_ref().map(|answer| {
+                Arc::new(page::create(
+                    PageConfig::default(),
+                    db_conn.clone(),
+                    auth.clone(),
+                    chat.clone(),
+                    thread.clone(),
+                    context.clone(),
+                    retrieval.clone(),
+                    answer.clone(),
+                )) as Arc<dyn PageService>
+            })
+        });
+
         let user_group = Arc::new(user_group::create(db_conn.clone()));
         let access_policy = Arc::new(access_policy::create(db_conn.clone(), context.clone()));
         let notification = Arc::new(notification::create(db_conn.clone()));
@@ -131,7 +159,9 @@ impl ServerContext {
             repository.git(),
             repository.third_party(),
             integration.clone(),
+            ingestion.clone(),
             repository.clone(),
+            page.clone(),
             context.clone(),
             license.clone(),
             notification.clone(),
@@ -147,11 +177,13 @@ impl ServerContext {
             auth,
             web_documents,
             thread,
+            page,
             context,
             license,
             repository,
             integration,
             user_event,
+            ingestion,
             job,
             logger,
             code,
@@ -307,6 +339,10 @@ impl ServiceLocator for ArcServerContext {
         self.0.notification.clone()
     }
 
+    fn ingestion(&self) -> Arc<dyn IngestionService> {
+        self.0.ingestion.clone()
+    }
+
     fn job(&self) -> Arc<dyn JobService> {
         self.0.job.clone()
     }
@@ -351,6 +387,10 @@ impl ServiceLocator for ArcServerContext {
         self.0.thread.clone()
     }
 
+    fn page(&self) -> Option<Arc<dyn PageService>> {
+        self.0.page.clone()
+    }
+
     fn context(&self) -> Arc<dyn ContextService> {
         self.0.context.clone()
     }
@@ -372,8 +412,10 @@ pub async fn create_service_locator(
     code: Arc<dyn CodeSearch>,
     repository: Arc<dyn RepositoryService>,
     integration: Arc<dyn IntegrationService>,
+    ingestion: Arc<dyn IngestionService>,
     job: Arc<dyn JobService>,
     answer: Option<Arc<AnswerService>>,
+    retrieval: Arc<RetrievalService>,
     context: Arc<dyn ContextService>,
     web_documents: Arc<dyn WebDocumentService>,
     mail: Arc<dyn EmailService>,
@@ -391,8 +433,10 @@ pub async fn create_service_locator(
             code,
             repository,
             integration,
+            ingestion,
             job,
             answer,
+            retrieval,
             context,
             web_documents,
             mail,

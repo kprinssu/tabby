@@ -7,7 +7,7 @@
   "repository": "https://github.com/TabbyML/tabby",
   "bugs": "https://github.com/TabbyML/tabby/issues",
   "license": "Apache-2.0",
-  "version": "1.19.0-dev",
+  "version": "1.27.0-dev",
   "keywords": [
     "ai",
     "autocomplete",
@@ -100,6 +100,11 @@
         "category": "Tabby"
       },
       {
+        "command": "tabby.chat.codeReviewCodeBlock",
+        "title": "Code Review",
+        "category": "Tabby"
+      },
+      {
         "command": "tabby.chat.generateCodeBlockDoc",
         "title": "Generate Docs",
         "category": "Tabby"
@@ -114,6 +119,12 @@
         "title": "Generate Commit Message",
         "category": "Tabby",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "tabby.chat.generateBranchName",
+        "title": "Create Branch with Suggestions",
+        "category": "Tabby",
+        "icon": "$(git-branch)"
       },
       {
         "command": "tabby.chat.edit.start",
@@ -139,11 +150,44 @@
         "command": "tabby.chat.createPanel",
         "title": "Open Chat in Editor",
         "category": "Tabby"
+      },
+      {
+        "command": "tabby.chat.navigate.newChat",
+        "title": "New Chat",
+        "icon": "$(add)",
+        "enablement": "tabby.chatSidePanelStatus === 'ready'",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.chat.navigate.history",
+        "title": "Chat History",
+        "icon": "$(history)",
+        "enablement": "tabby.chatSidePanelStatus === 'ready'",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.toggleLanguageInlineCompletion",
+        "title": "Enable/Disable Inline Completion for Current Language",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.terminal.explainSelection",
+        "title": "Explain",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.terminal.addSelectionToChat",
+        "title": "Add Selection to Chat",
+        "category": "Tabby"
       }
     ],
     "submenus": [
       {
         "id": "tabby.submenu",
+        "label": "Tabby"
+      },
+      {
+        "id": "tabby.terminal.submenu",
         "label": "Tabby"
       }
     ],
@@ -155,14 +199,34 @@
           "group": "tabby.submenu.0edit@1"
         },
         {
+          "command": "tabby.chat.explainCodeBlock",
+          "when": "editorHasSelection && tabby.chatEnabled",
+          "group": "tabby.submenu.1edit@1"
+        },
+        {
+          "command": "tabby.chat.codeReviewCodeBlock",
+          "when": "editorHasSelection && tabby.chatEnabled",
+          "group": "tabby.submenu.1edit@2"
+        },
+        {
           "command": "tabby.chat.addRelevantContext",
           "when": "editorHasSelection && tabby.chatEnabled",
-          "group": "tabby.submenu.1chat@1"
+          "group": "tabby.submenu.2chat@1"
         },
         {
           "command": "tabby.chat.addFileContext",
           "when": "tabby.chatEnabled",
-          "group": "tabby.submenu.1chat@2"
+          "group": "tabby.submenu.2chat@2"
+        }
+      ],
+      "tabby.terminal.submenu": [
+        {
+          "command": "tabby.terminal.explainSelection",
+          "group": "tabby.terminal.action"
+        },
+        {
+          "command": "tabby.terminal.addSelectionToChat",
+          "group": "tabby.terminal.context"
         }
       ],
       "commandPalette": [
@@ -196,7 +260,11 @@
         },
         {
           "command": "tabby.chat.generateCommitMessage",
-          "when": "false"
+          "when": "tabby.chatEnabled"
+        },
+        {
+          "command": "tabby.chat.generateBranchName",
+          "when": "tabby.chatEnabled"
         },
         {
           "command": "tabby.chat.edit.start",
@@ -230,8 +298,26 @@
       ],
       "view/title": [
         {
+          "command": "tabby.chat.navigate.newChat",
+          "when": "view == tabby.chatView",
+          "group": "navigation@0"
+        },
+        {
+          "command": "tabby.chat.navigate.history",
+          "when": "view == tabby.chatView",
+          "group": "navigation@1"
+        },
+        {
           "command": "tabby.chat.createPanel",
-          "when": "view == tabby.chatView"
+          "when": "view == tabby.chatView",
+          "group": "0_new"
+        }
+      ],
+      "terminal/context": [
+        {
+          "submenu": "tabby.terminal.submenu",
+          "group": "2_tabby",
+          "when": "tabby.terminalContextEnabled"
         }
       ]
     },
@@ -298,7 +384,7 @@
         "properties": {
           "tabby.endpoint": {
             "type": "string",
-            "default": "",
+            "default": "http://localhost:8080",
             "pattern": "(^$)|(^https?:\\/\\/\\S+$)",
             "patternErrorMessage": "Please enter a valid HTTP or HTTPS URL.",
             "markdownDescription": "Please use the command [Connect to Server](command:tabby.connectToServer) to specify the endpoint of the Tabby server."
@@ -332,6 +418,14 @@
                   "Automatic trigger when you stop typing",
                   "Manual trigger by pressing `Alt + \\`"
                 ]
+              },
+              "inlineCompletion.disabledLanguages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "List of language IDs for which code completion should be disabled. Use the 'Toggle Single Language Inline Completion' command to easily enable or disable completion for the current language."
               },
               "chatEdit.history": {
                 "type": "integer",
@@ -397,12 +491,12 @@
         "command": "tabby.chat.edit.accept",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "tabby.chatEditResolving && editorTextFocus && !editorReadonly"
+        "when": "tabby.chatEditResolving && !tabby.chatEditInProgress && editorTextFocus && !editorReadonly"
       },
       {
         "command": "tabby.chat.edit.discard",
         "key": "escape",
-        "when": "tabby.chatEditResolving && editorTextFocus && !editorReadonly"
+        "when": "tabby.chatEditResolving && !tabby.chatEditInProgress && editorTextFocus && !editorReadonly"
       },
       {
         "command": "tabby.chat.addRelevantContext",
@@ -454,9 +548,12 @@
     "ovsx:publish-prerelease": "ovsx publish --no-dependencies --pre-release --pat $OVSX_PAT",
     "package": "pnpm run vscode:package",
     "publish": "pnpm run vscode:publish && pnpm run ovsx:publish",
-    "publish-prerelease": "pnpm run vscode:publish-prerelease && pnpm run ovsx:publish-prerelease"
+    "publish-prerelease": "pnpm run vscode:publish-prerelease && pnpm run ovsx:publish-prerelease",
+    "test": "mocha"
   },
   "devDependencies": {
+    "@types/dedent": "^0.7.2",
+    "@types/chai": "^4.3.5",
     "@types/deep-equal": "^1.0.4",
     "@types/diff": "^5.2.1",
     "@types/fs-extra": "^11.0.1",
@@ -472,6 +569,8 @@
     "@vscode/test-web": "^0.0.63",
     "@vscode/vsce": "^2.15.0",
     "assert": "^2.0.0",
+    "debounce": "^2.2.0",
+    "chai": "^4.3.11",
     "dedent": "^0.7.0",
     "deep-equal": "^2.2.1",
     "diff": "^5.2.0",
@@ -481,6 +580,7 @@
     "eslint-config-prettier": "^9.0.0",
     "fs-extra": "^11.1.1",
     "get-installed-path": "^4.0.8",
+    "mocha": "^10.2.0",
     "object-hash": "^3.0.0",
     "ovsx": "^0.9.5",
     "prettier": "^3.0.0",

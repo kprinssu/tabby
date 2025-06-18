@@ -1,5 +1,5 @@
 import { commands, window, workspace, Range } from "vscode";
-import { Client } from "./lsp/Client";
+import { Client } from "./lsp/client";
 import { Config } from "./Config";
 
 export class ContextVariables {
@@ -8,6 +8,7 @@ export class ContextVariables {
   private chatEditResolvingValue = false;
   private inlineCompletionTriggerModeValue: "automatic" | "manual" = "automatic";
   private chatSidePanelVisibleValue = false;
+  private terminalContextEnabledValue = false;
 
   constructor(
     private readonly client: Client,
@@ -61,6 +62,10 @@ export class ContextVariables {
     commands.executeCommand("setContext", "tabby.status", value);
   }
 
+  set chatSidePanelStatus(value: "loading" | "ready" | "error" | undefined) {
+    commands.executeCommand("setContext", "tabby.chatSidePanelStatus", value);
+  }
+
   // FIXME(@icycodes): context variables should not have getters
 
   get chatEnabled(): boolean {
@@ -106,5 +111,14 @@ export class ContextVariables {
   set chatSidePanelVisible(value: boolean) {
     commands.executeCommand("setContext", "tabby.chatSidePanelVisible", value);
     this.chatSidePanelVisibleValue = value;
+  }
+
+  set terminalContextEnabled(value: boolean) {
+    commands.executeCommand("setContext", "tabby.terminalContextEnabled", value);
+    this.terminalContextEnabledValue = value;
+  }
+
+  get terminalContextEnabled(): boolean {
+    return this.terminalContextEnabledValue;
   }
 }

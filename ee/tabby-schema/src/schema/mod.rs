@@ -4,12 +4,15 @@ pub mod auth;
 pub mod constants;
 pub mod context;
 pub mod email;
+pub mod ingestion;
 pub mod integration;
 pub mod interface;
 pub mod job;
 pub mod license;
 pub mod notification;
+pub mod page;
 pub mod repository;
+pub mod retrieval;
 pub mod setting;
 pub mod thread;
 pub mod user_event;
@@ -23,8 +26,9 @@ use access_policy::{AccessPolicyService, SourceIdAccessPolicy};
 use async_openai_alt::{
     error::OpenAIError,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
     },
 };
 use auth::{
@@ -44,6 +48,11 @@ use juniper::{
 };
 use ldap3::result::LdapError;
 use notification::NotificationService;
+use page::{
+    CreatePageRunInput, CreatePageSectionRunInput, CreateThreadToPageRunInput, PageRunStream,
+    SectionRunStream, ThreadToPageRunStream, UpdatePageContentInput, UpdatePageSectionContentInput,
+    UpdatePageSectionTitleInput, UpdatePageTitleInput,
+};
 use repository::RepositoryGrepOutput;
 use strum::IntoEnumIterator;
 use tabby_common::{
@@ -62,15 +71,17 @@ use validator::{Validate, ValidationErrors};
 use worker::WorkerService;
 
 use self::{
-    analytic::{AnalyticService, CompletionStats, DiskUsageStats},
+    analytic::{AnalyticService, ChatCompletionStats, CompletionStats, DiskUsageStats},
     auth::{
         JWTPayload, OAuthCredential, OAuthProvider, PasswordChangeInput, PasswordResetInput,
         RequestInvitationInput, RequestPasswordResetEmailInput, UpdateOAuthCredentialInput,
     },
     email::{EmailService, EmailSetting, EmailSettingInput},
+    ingestion::{IngestionService, IngestionStats},
     integration::{Integration, IntegrationKind, IntegrationService},
     job::JobStats,
     license::{IsLicenseValid, LicenseInfo, LicenseService, LicenseType},
+    page::PageService,
     repository::{
         CreateIntegrationInput, FileEntrySearchResult, ProvidedRepository, Repository,
         RepositoryKind, RepositoryService, UpdateIntegrationInput,
@@ -95,6 +106,7 @@ pub trait ServiceLocator: Send + Sync {
     fn completion(&self) -> Option<Arc<dyn CompletionStream>>;
     fn embedding(&self) -> Arc<dyn EmbeddingService>;
     fn logger(&self) -> Arc<dyn EventLogger>;
+    fn ingestion(&self) -> Arc<dyn IngestionService>;
     fn job(&self) -> Arc<dyn JobService>;
     fn repository(&self) -> Arc<dyn RepositoryService>;
     fn integration(&self) -> Arc<dyn IntegrationService>;
@@ -105,6 +117,7 @@ pub trait ServiceLocator: Send + Sync {
     fn user_event(&self) -> Arc<dyn UserEventService>;
     fn web_documents(&self) -> Arc<dyn WebDocumentService>;
     fn thread(&self) -> Arc<dyn ThreadService>;
+    fn page(&self) -> Option<Arc<dyn PageService>>;
     fn context(&self) -> Arc<dyn ContextService>;
     fn user_group(&self) -> Arc<dyn UserGroupService>;
     fn access_policy(&self) -> Arc<dyn AccessPolicyService>;
@@ -260,6 +273,48 @@ struct ModelBackendHealthInfo {
     latency_ms: i32,
 }
 
+#[derive(GraphQLObject, Clone, Debug)]
+pub struct ChatCompletionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl From<ChatCompletionRequestMessage> for ChatCompletionMessage {
+    fn from(x: ChatCompletionRequestMessage) -> Self {
+        match x {
+            ChatCompletionRequestMessage::User(x) => ChatCompletionMessage {
+                role: "user".into(),
+                content: match x.content {
+                    ChatCompletionRequestUserMessageContent::Text(x) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Assistant(x) => ChatCompletionMessage {
+                role: "assistant".into(),
+                content: match x.content {
+                    Some(ChatCompletionRequestAssistantMessageContent::Text(x)) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Tool(_x) => ChatCompletionMessage {
+                role: "tool".into(),
+                content: "".into(),
+            },
+            ChatCompletionRequestMessage::System(x) => ChatCompletionMessage {
+                role: "system".into(),
+                content: match x.content {
+                    ChatCompletionRequestSystemMessageContent::Text(x) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Function(_x) => ChatCompletionMessage {
+                role: "function".into(),
+                content: "".into(),
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Query;
 
@@ -277,6 +332,7 @@ impl Query {
     /// List users, accessible for all login users.
     async fn users(
         ctx: &Context,
+        ids: Option<Vec<ID>>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
@@ -291,7 +347,7 @@ impl Query {
             |after, before, first, last| async move {
                 ctx.locator
                     .auth()
-                    .list_users(after, before, first, last)
+                    .list_users(ids, after, before, first, last)
                     .await
                     .map(|users| users.into_iter().map(UserValue::UserSecured).collect())
             },
@@ -485,6 +541,12 @@ impl Query {
             is_chat_enabled: ctx.locator.worker().is_chat_enabled().await?,
             is_email_configured: ctx.locator.email().read_setting().await?.is_some(),
             allow_self_signup: ctx.locator.auth().allow_self_signup().await?,
+            disable_password_login: ctx
+                .locator
+                .setting()
+                .read_security_setting()
+                .await?
+                .disable_password_login,
             is_demo_mode: env::is_demo_mode(),
         })
     }
@@ -526,6 +588,34 @@ impl Query {
         ctx.locator
             .analytic()
             .daily_stats(start, end, users, languages.unwrap_or_default())
+            .await
+    }
+
+    async fn chat_daily_stats_in_past_year(
+        ctx: &Context,
+        users: Option<Vec<ID>>,
+    ) -> Result<Vec<ChatCompletionStats>> {
+        let users = users.unwrap_or_default();
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
+        ctx.locator
+            .analytic()
+            .chat_daily_stats_in_past_year(users)
+            .await
+    }
+
+    async fn chat_daily_stats(
+        ctx: &Context,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        users: Option<Vec<ID>>,
+    ) -> Result<Vec<ChatCompletionStats>> {
+        let users = users.unwrap_or_default();
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
+        ctx.locator
+            .analytic()
+            .chat_daily_stats(start, end, users)
             .await
     }
 
@@ -587,7 +677,7 @@ impl Query {
     }
 
     async fn context_info(ctx: &Context) -> Result<ContextInfo> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
         ctx.locator.context().read(Some(&user.policy)).await
     }
 
@@ -643,6 +733,14 @@ impl Query {
         .await
     }
 
+    async fn ingestion_status(
+        ctx: &Context,
+        sources: Option<Vec<String>>,
+    ) -> Result<Vec<IngestionStats>> {
+        check_admin(ctx).await?;
+        ctx.locator.ingestion().stats(sources).await
+    }
+
     async fn threads(
         ctx: &Context,
         ids: Option<Vec<ID>>,
@@ -652,8 +750,9 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<thread::Thread>> {
-        check_user(ctx).await?;
-        relay::query_async(
+        let user = check_user_allow_auth_token(ctx).await?;
+
+        let threads = relay::query_async(
             after,
             before,
             first,
@@ -662,6 +761,37 @@ impl Query {
                 ctx.locator
                     .thread()
                     .list(ids.as_deref(), is_ephemeral, after, before, first, last)
+                    .await
+            },
+        )
+        .await?;
+
+        for thread in threads.edges.iter() {
+            let thread = &thread.node;
+            user.policy
+                .check_read_thread(&thread.user_id, thread.is_ephemeral)?;
+        }
+
+        Ok(threads)
+    }
+
+    async fn my_threads(
+        ctx: &Context,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<thread::Thread>> {
+        let user = check_user_allow_auth_token(ctx).await?;
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                ctx.locator
+                    .thread()
+                    .list_owned(&user.id, after, before, first, last)
                     .await
             },
         )
@@ -679,7 +809,16 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<thread::Message>> {
-        check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
+
+        let thread = ctx
+            .locator
+            .thread()
+            .get(&thread_id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound("thread not found"))?;
+        user.policy
+            .check_read_thread(&thread.user_id, thread.is_ephemeral)?;
 
         relay::query_async(
             after,
@@ -690,6 +829,67 @@ impl Query {
                 ctx.locator
                     .thread()
                     .list_thread_messages(&thread_id, after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Read pages by page IDs.
+    async fn pages(
+        ctx: &Context,
+        ids: Option<Vec<ID>>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<page::Page>> {
+        check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                page_service
+                    .list(ids.as_deref(), after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn page_sections(
+        ctx: &Context,
+        page_id: ID,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<page::PageSection>> {
+        check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                page_service
+                    .list_sections(&page_id, after, before, first, last)
                     .await
             },
         )
@@ -779,7 +979,6 @@ impl Query {
                     let config = CompletionConfig::default();
                     let options = CompletionOptionsBuilder::default()
                         .max_decoding_tokens(config.max_decoding_tokens as i32)
-                        .max_input_length(config.max_input_length)
                         .sampling_temperature(0.1)
                         .seed(0)
                         .build()
@@ -836,6 +1035,23 @@ impl Query {
             }
         }
     }
+
+    async fn read_repository_related_questions(
+        ctx: &Context,
+        source_id: String,
+    ) -> Result<Vec<String>, CoreError> {
+        let user = check_user(ctx).await?;
+        ctx.locator
+            .repository()
+            .read_repository_related_questions(
+                ctx.locator
+                    .chat()
+                    .ok_or(CoreError::NotFound("The Chat didn't initialize yet"))?,
+                &user.policy,
+                source_id,
+            )
+            .await
+    }
 }
 
 #[derive(GraphQLObject)]
@@ -844,6 +1060,7 @@ pub struct ServerInfo {
     is_chat_enabled: bool,
     is_email_configured: bool,
     allow_self_signup: bool,
+    disable_password_login: bool,
     is_demo_mode: bool,
 }
 
@@ -1305,6 +1522,147 @@ impl Mutation {
         Ok(true)
     }
 
+    // page mutations
+    async fn update_page_title(ctx: &Context, input: UpdatePageTitleInput) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let page = page_service.get(&input.id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.update_title(&input.id, &input.title).await?;
+        Ok(true)
+    }
+
+    async fn update_page_content(ctx: &Context, input: UpdatePageContentInput) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let page = page_service.get(&input.id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .update_content(&input.id, &input.content)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_page_section_title(
+        ctx: &Context,
+        input: UpdatePageSectionTitleInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let section = page_service.get_section(&input.id).await?;
+
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .update_section_title(&input.id, &input.title)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_page_section_content(
+        ctx: &Context,
+        input: UpdatePageSectionContentInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let section = page_service.get_section(&input.id).await?;
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+        page_service
+            .update_section_content(&input.id, &input.content)
+            .await?;
+        Ok(true)
+    }
+
+    /// delete a page and all its sections.
+    async fn delete_page(ctx: &Context, id: ID) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let page = page_service.get(&id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+        page_service.delete(&id).await.map(|_| true)
+    }
+
+    /// delete a single page section.
+    async fn delete_page_section(ctx: &Context, section_id: ID) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        let section = page_service.get_section(&section_id).await?;
+
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.delete_section(&section_id).await.map(|_| true)
+    }
+
+    async fn move_page_section(
+        ctx: &Context,
+        id: ID,
+        direction: page::MoveSectionDirection,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let section = page_service.get_section(&id).await?;
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .move_section(&page.id, &id, direction)
+            .await
+            .map(|_| true)
+    }
+
     async fn create_custom_document(ctx: &Context, input: CreateCustomDocumentInput) -> Result<ID> {
         check_admin(ctx).await?;
         input.validate()?;
@@ -1462,7 +1820,7 @@ impl Subscription {
 
         thread
             .create_run(
-                &user.policy,
+                &user,
                 &thread_id,
                 &input.options,
                 input.thread.user_message.attachments.as_ref(),
@@ -1494,7 +1852,7 @@ impl Subscription {
             .await?;
 
         svc.create_run(
-            &user.policy,
+            &user,
             &input.thread_id,
             &input.options,
             input.additional_user_message.attachments.as_ref(),
@@ -1502,6 +1860,59 @@ impl Subscription {
             false,
         )
         .await
+    }
+
+    async fn create_page_run(ctx: &Context, input: CreatePageRunInput) -> Result<PageRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        page_service
+            .create_run(&user.policy, &user.id, &input)
+            .await
+    }
+
+    /// Utilize an existing thread and its messages to create a page.
+    /// This will automatically generate:
+    /// - the page title and a summary of the content.
+    /// - a few sections based on the thread messages.
+    async fn create_thread_to_page_run(
+        ctx: &Context,
+        input: CreateThreadToPageRunInput,
+    ) -> Result<ThreadToPageRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        page_service
+            .convert_thread_to_page(&user.policy, &user.id, &input)
+            .await
+    }
+
+    async fn create_page_section_run(
+        ctx: &Context,
+        input: CreatePageSectionRunInput,
+    ) -> Result<SectionRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let page = page_service.get(&input.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.append_section(&user.policy, &input).await
     }
 }
 

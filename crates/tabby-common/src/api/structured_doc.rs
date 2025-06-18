@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
 use tantivy::{
     schema::{self, document::CompactDocValue, Value},
     TantivyDocument,
@@ -21,6 +22,9 @@ pub enum DocSearchDocument {
     Web(DocSearchWebDocument),
     Issue(DocSearchIssueDocument),
     Pull(DocSearchPullDocument),
+    Commit(DocSearchCommit),
+    Page(DocSearchPageDocument),
+    Ingested(DocSearchIngestedDocument),
 }
 
 #[derive(Error, Debug)]
@@ -77,6 +81,29 @@ pub struct DocSearchPullDocument {
     pub merged: bool,
 }
 
+#[derive(Clone)]
+pub struct DocSearchCommit {
+    pub sha: String,
+    pub message: String,
+    pub author_email: String,
+    pub author_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+pub struct DocSearchPageDocument {
+    pub link: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Clone)]
+pub struct DocSearchIngestedDocument {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub link: Option<String>,
+}
+
 pub trait FromTantivyDocument {
     fn from_tantivy_document(doc: &TantivyDocument, chunk: &TantivyDocument) -> Option<Self>
     where
@@ -96,6 +123,13 @@ impl FromTantivyDocument for DocSearchDocument {
                 .map(DocSearchDocument::Issue),
             "pull" => DocSearchPullDocument::from_tantivy_document(doc, chunk)
                 .map(DocSearchDocument::Pull),
+            "commit" => {
+                DocSearchCommit::from_tantivy_document(doc, chunk).map(DocSearchDocument::Commit)
+            }
+            "page" => DocSearchPageDocument::from_tantivy_document(doc, chunk)
+                .map(DocSearchDocument::Page),
+            "ingested" => DocSearchIngestedDocument::from_tantivy_document(doc, chunk)
+                .map(DocSearchDocument::Ingested),
             _ => None,
         }
     }
@@ -189,7 +223,7 @@ impl FromTantivyDocument for DocSearchPullDocument {
             schema.field_attributes,
             structured_doc::fields::pull::BODY,
         );
-        let diff = get_json_text_field(
+        let diff = get_json_option_text_field(
             doc,
             schema.field_attributes,
             structured_doc::fields::pull::DIFF,
@@ -204,8 +238,101 @@ impl FromTantivyDocument for DocSearchPullDocument {
             link: link.into(),
             author_email: author_email.map(Into::into),
             body: body.into(),
-            diff: diff.into(),
+            diff: diff.unwrap_or_default().into(),
             merged,
+        })
+    }
+}
+
+impl FromTantivyDocument for DocSearchCommit {
+    fn from_tantivy_document(doc: &TantivyDocument, _chunk: &TantivyDocument) -> Option<Self> {
+        let schema = IndexSchema::instance();
+        let sha = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::commit::SHA,
+        )
+        .to_string();
+        let message = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::commit::MESSAGE,
+        )
+        .to_string();
+        let author_email = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::commit::AUTHOR_EMAIL,
+        )
+        .to_string();
+        let author_at = get_json_date_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::commit::AUTHOR_AT,
+        )
+        .unwrap_or_default();
+
+        Some(Self {
+            sha,
+            message,
+            author_email,
+            author_at,
+        })
+    }
+}
+
+impl FromTantivyDocument for DocSearchPageDocument {
+    fn from_tantivy_document(doc: &TantivyDocument, chunk: &TantivyDocument) -> Option<Self> {
+        let schema = IndexSchema::instance();
+        let link = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::page::LINK,
+        );
+        let title = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::page::TITLE,
+        );
+        let content = get_json_text_field(
+            chunk,
+            schema.field_chunk_attributes,
+            structured_doc::fields::page::CHUNK_CONTENT,
+        );
+
+        Some(Self {
+            link: link.into(),
+            title: title.into(),
+            content: content.into(),
+        })
+    }
+}
+
+impl FromTantivyDocument for DocSearchIngestedDocument {
+    fn from_tantivy_document(doc: &TantivyDocument, chunk: &TantivyDocument) -> Option<Self> {
+        let schema = IndexSchema::instance();
+        let id = doc.get_first(schema.field_id).unwrap().as_str().unwrap();
+        let title = get_json_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::ingested::TITLE,
+        );
+        let body = get_json_text_field(
+            chunk,
+            schema.field_chunk_attributes,
+            structured_doc::fields::ingested::CHUNK_BODY,
+        );
+        let link = get_json_option_text_field(
+            doc,
+            schema.field_attributes,
+            structured_doc::fields::page::LINK,
+        );
+
+        Some(Self {
+            id: id.into(),
+            link: link.map(Into::into),
+            title: title.into(),
+            body: body.into(),
         })
     }
 }
@@ -251,4 +378,15 @@ fn get_json_option_text_field<'a>(
     name: &str,
 ) -> Option<&'a str> {
     get_json_option_field(doc, field, name).and_then(|field| field.as_str())
+}
+
+fn get_json_date_field(
+    doc: &TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> Option<DateTime<Utc>> {
+    get_json_option_field(doc, field, name)
+        .and_then(|field| field.as_datetime())
+        .map(|x| x.into_timestamp_secs())
+        .and_then(|x| Utc.timestamp_opt(x, 0).single())
 }

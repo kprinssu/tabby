@@ -11,7 +11,8 @@ use tabby_common::{
     usage,
 };
 use tabby_download::ModelKind;
-use tabby_inference::ChatCompletionStream;
+#[cfg(feature = "ee")]
+use tabby_webserver::EEApiDoc;
 use tokio::{sync::oneshot::Sender, time::sleep};
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, warn};
@@ -22,7 +23,7 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    routes::{self, run_app},
+    routes::{self, run_app, ChatState},
     services::{
         self,
         code::create_code_search,
@@ -53,7 +54,13 @@ Install following IDE / Editor extensions to get started with [Tabby](https://gi
     servers(
         (url = "/", description = "Server"),
     ),
-    paths(routes::log_event, routes::completions, routes::chat_completions_utoipa, routes::health, routes::setting),
+    paths(
+        routes::log_event,
+        routes::completions,
+        routes::chat_completions_utoipa,
+        routes::health,
+        routes::setting,
+    ),
     components(schemas(
         api::event::LogEventRequest,
         completion::CompletionRequest,
@@ -64,6 +71,7 @@ Install following IDE / Editor extensions to get started with [Tabby](https://gi
         completion::Snippet,
         completion::DebugOptions,
         completion::DebugData,
+        completion::EditHistory,
         health::HealthState,
         health::Version,
         api::server_setting::ServerSetting,
@@ -160,18 +168,27 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     )
     .await;
 
+    let chat_state = chat.as_ref().map(|c| {
+        Arc::new(ChatState {
+            chat_completion: c.clone(),
+            logger: logger.clone(),
+        })
+    });
     let mut api = api_router(
         args,
         &config,
         logger.clone(),
         code.clone(),
         completion,
-        chat.clone(),
+        chat_state,
         webserver,
     )
     .await;
+    let mut doc = ApiDoc::openapi();
+    #[cfg(feature = "ee")]
+    doc.merge(EEApiDoc::openapi());
     let mut ui = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", doc))
         .fallback(|| async { axum::response::Redirect::temporary("/swagger-ui") });
 
     #[cfg(feature = "ee")]
@@ -220,7 +237,7 @@ async fn api_router(
     logger: Arc<dyn EventLogger>,
     _code: Arc<dyn CodeSearch>,
     completion_state: Option<CompletionService>,
-    chat_state: Option<Arc<dyn ChatCompletionStream>>,
+    chat_state: Option<Arc<ChatState>>,
     webserver: Option<bool>,
 ) -> Router {
     let mut routers = vec![];

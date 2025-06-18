@@ -1,3 +1,77 @@
+## 1.26.0
+
+### Features
+
+- **Chat Panel**:
+
+  - Requires Tabby Server `0.27.0` or later.
+  - Added support for executing suggested shell scripts directly via a button in the code component, similar to the `Apply in Editor` feature.
+  - Added support for using `@changes` to include the current Git diff into the context.
+  - You can now select code in the editor and use the `Code Review` option from the context menu to review your code and add comments using Tabby Chat.
+  - Improved the UI for file and symbol context included by `@`.
+
+- **Code Completion**:
+
+  - Added support for disabling code completion for specific languages. This can be configured via the status bar item menu or in advanced settings.
+
+- **Inline Edit**:
+
+  - Added support for including symbols as context. Use `@` to trigger a quick pick and select `Symbols` to choose available items.
+
+- **Git Integration**:
+  - Improved the `Generate Commit Messages` command. After generating commit messages, if you are still on the `main` or `master` branch, Tabby will automatically prompt you to create a new branch with suggested branch names.
+  - Added a new `Create Branch with Suggestions` command, accessible from the command palette.
+
+## 1.24.0
+
+### Features
+
+- **Chat**:
+  - Requires a server version of 0.26.0 or later.
+  - Added support to view recent chat history in the chat panel.
+- Added support for other extensions to read Tabby server configurations after user grants permission.
+
+### Fixes & Improvements
+
+- **Inline Edit**: Added keyboard shortcut hints for `Accept` and `Discard` actions in the inline edit preview.
+- Fixed the status bar item not updating when disconnected from the server.
+
+## 1.22.0
+
+### Features
+
+- **Chat**:
+  - Requires a server version of 0.25.0 or later.
+  - You can now use `@` to add a selected symbol (functions, variables, etc.) as context for the chat conversation when typing in the chat panel.
+- **Inline Edit**:
+  - You can now use `@` to add a selected file as context for the inline edit.
+  - The edit preview now shows color decoration for character diffs.
+
+### Fixes & Improvements
+
+- Optimized the display of file paths in the chat panel.
+- Fixed a bug causing incorrect indentation when the code uses tab indentation.
+
+## 1.20.1
+
+### Fixes & Improvements
+
+- **Chat**: Optimized file search performance when using `@` to add file context.
+
+## 1.20.0
+
+### Features
+
+- **Chat**:
+  - You can now use `@` to add a selected file as context for the chat conversation when typing in the chat panel. (Requires connecting to a Tabby server version 0.24.0 or later.)
+- Added an inline edit option in the editor right-click context menu.
+
+### Fixes & Improvements
+
+- Retained the chat conversation when moving the chat panel to a different view group. (Requires connecting to a Tabby server version 0.24.0 or later.)
+- The chat panel now uses the active editor as context by default.
+- Fixed the handling of inline edit cancellations.
+
 ## 1.18.0
 
 ### Features

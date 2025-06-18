@@ -3,11 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use juniper::ID;
-use tabby_db::{DbConn, ThreadMessageAttachmentDoc, ThreadMessageDAO};
+use tabby_db::{AttachmentDoc, DbConn, ThreadMessageDAO};
 use tabby_schema::{
-    auth::AuthenticationService,
-    bail, from_thread_message_attachment_document,
-    policy::AccessPolicy,
+    auth::{AuthenticationService, UserSecured},
+    bail,
+    context::ContextService,
+    from_thread_message_attachment_document,
     thread::{
         self, CreateMessageInput, CreateThreadInput, MessageAttachment, MessageAttachmentDoc,
         MessageAttachmentInput, ThreadRunItem, ThreadRunOptionsInput, ThreadRunStream,
@@ -16,12 +17,13 @@ use tabby_schema::{
     AsID, AsRowid, DbEnum, Result,
 };
 
-use super::{answer::AnswerService, graphql_pagination_to_filter};
+use super::{answer::AnswerService, graphql_pagination_to_filter, utils::get_source_id};
 
 struct ThreadServiceImpl {
     db: DbConn,
     auth: Option<Arc<dyn AuthenticationService>>,
     answer: Option<Arc<AnswerService>>,
+    context: Arc<dyn ContextService>,
 }
 
 impl ThreadServiceImpl {
@@ -41,22 +43,27 @@ impl ThreadServiceImpl {
         output.reserve(messages.len());
 
         for message in messages {
-            let code = message.code_attachments;
-            let client_code = message.client_code_attachments;
-            let doc = message.doc_attachments;
-
-            let attachment = MessageAttachment {
-                code: code
-                    .map(|x| x.0.into_iter().map(|i| i.into()).collect())
-                    .unwrap_or_default(),
-                client_code: client_code
-                    .map(|x| x.0.into_iter().map(|i| i.into()).collect())
-                    .unwrap_or_default(),
-                doc: if let Some(docs) = doc {
-                    self.to_message_attachment_docs(docs.0).await
-                } else {
-                    vec![]
-                },
+            let attachment = if let Some(attachment) = message.attachment {
+                let code = attachment.0.code;
+                let client_code = attachment.0.client_code;
+                let doc = attachment.0.doc;
+                let code_file_list = attachment.0.code_file_list;
+                MessageAttachment {
+                    code: code
+                        .map(|x| x.into_iter().map(|i| i.into()).collect())
+                        .unwrap_or_default(),
+                    client_code: client_code
+                        .map(|x| x.into_iter().map(|i| i.into()).collect())
+                        .unwrap_or_default(),
+                    doc: if let Some(docs) = doc {
+                        self.to_message_attachment_docs(docs).await
+                    } else {
+                        vec![]
+                    },
+                    code_file_list: code_file_list.map(|x| x.into()),
+                }
+            } else {
+                Default::default()
             };
 
             output.push(thread::Message {
@@ -76,18 +83,20 @@ impl ThreadServiceImpl {
 
     async fn to_message_attachment_docs(
         &self,
-        thread_docs: Vec<ThreadMessageAttachmentDoc>,
+        thread_docs: Vec<AttachmentDoc>,
     ) -> Vec<MessageAttachmentDoc> {
         let mut output = vec![];
         output.reserve(thread_docs.len());
         for thread_doc in thread_docs {
-            let id = match &thread_doc {
-                ThreadMessageAttachmentDoc::Issue(issue) => issue.author_user_id.as_deref(),
-                ThreadMessageAttachmentDoc::Pull(pull) => pull.author_user_id.as_deref(),
-                _ => None,
-            };
-            let user = if let Some(auth) = self.auth.as_ref() {
-                if let Some(id) = id {
+            let author = if let Some(auth) = self.auth.as_ref() {
+                let author_id = match &thread_doc {
+                    AttachmentDoc::Issue(issue) => issue.author_user_id.as_deref(),
+                    AttachmentDoc::Pull(pull) => pull.author_user_id.as_deref(),
+                    AttachmentDoc::Commit(commit) => commit.author_user_id.as_deref(),
+                    _ => None,
+                };
+
+                if let Some(id) = author_id {
                     auth.get_user(&juniper::ID::from(id.to_owned()))
                         .await
                         .ok()
@@ -99,7 +108,7 @@ impl ThreadServiceImpl {
                 None
             };
 
-            output.push(from_thread_message_attachment_document(thread_doc, user));
+            output.push(from_thread_message_attachment_document(thread_doc, author));
         }
         output
     }
@@ -146,7 +155,7 @@ impl ThreadService for ThreadServiceImpl {
 
     async fn create_run(
         &self,
-        policy: &AccessPolicy,
+        user: &UserSecured,
         thread_id: &ID,
         options: &ThreadRunOptionsInput,
         attachment_input: Option<&MessageAttachmentInput>,
@@ -182,8 +191,18 @@ impl ThreadService for ThreadServiceImpl {
             )
             .await?;
 
+        if let Some(code_query) = &options.code_query {
+            if let Some(source_id) =
+                get_source_id(self.context.clone(), &user.policy, code_query).await
+            {
+                self.db
+                    .update_thread_message_code_source_id(assistant_message_id, &source_id)
+                    .await?;
+            }
+        }
+
         let s = answer
-            .answer(policy, &messages, options, attachment_input)
+            .answer(user, &messages, options, attachment_input)
             .await?;
 
         // Copy ownership of db and thread_id for the stream
@@ -206,6 +225,10 @@ impl ThreadService for ThreadServiceImpl {
                         db.append_thread_message_content(assistant_message_id, &x.delta).await?;
                     }
 
+                    Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsCodeFileList(x)) => {
+                        db.update_thread_message_code_file_list_attachment(assistant_message_id, &x.file_list, x.truncated).await?;
+                    }
+
                     Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsCode(x)) => {
                         let code = x
                             .hits
@@ -214,7 +237,6 @@ impl ThreadService for ThreadServiceImpl {
                             .collect::<Vec<_>>();
                         db.update_thread_message_code_attachments(
                             assistant_message_id,
-                            &x.code_source_id,
                             &code,
                         ).await?;
                     }
@@ -240,8 +262,6 @@ impl ThreadService for ThreadServiceImpl {
 
                 yield item;
             }
-
-            yield Ok(ThreadRunItem::ThreadAssistantMessageCompleted(thread::ThreadAssistantMessageCompleted { id: assistant_message_id.as_id() }));
         };
 
         Ok(s.boxed())
@@ -278,6 +298,31 @@ impl ThreadService for ThreadServiceImpl {
         Ok(())
     }
 
+    async fn list_owned(
+        &self,
+        user_id: &ID,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<usize>,
+        last: Option<usize>,
+    ) -> Result<Vec<thread::Thread>> {
+        let (limit, skip_id, backwards) = graphql_pagination_to_filter(after, before, first, last)?;
+
+        let threads = self
+            .db
+            .list_threads(
+                None,
+                Some(user_id.as_rowid()?),
+                None,
+                limit,
+                skip_id,
+                backwards,
+            )
+            .await?;
+
+        Ok(threads.into_iter().map(Into::into).collect())
+    }
+
     async fn list(
         &self,
         ids: Option<&[ID]>,
@@ -294,9 +339,17 @@ impl ThreadService for ThreadServiceImpl {
                 .filter_map(|x| x.as_rowid().ok())
                 .collect::<Vec<_>>()
         });
+
         let threads = self
             .db
-            .list_threads(ids.as_deref(), is_ephemeral, limit, skip_id, backwards)
+            .list_threads(
+                ids.as_deref(),
+                None,
+                is_ephemeral,
+                limit,
+                skip_id,
+                backwards,
+            )
             .await?;
 
         Ok(threads.into_iter().map(Into::into).collect())
@@ -347,8 +400,14 @@ pub fn create(
     db: DbConn,
     answer: Option<Arc<AnswerService>>,
     auth: Option<Arc<dyn AuthenticationService>>,
+    context: Arc<dyn ContextService>,
 ) -> impl ThreadService {
-    ThreadServiceImpl { db, answer, auth }
+    ThreadServiceImpl {
+        db,
+        answer,
+        auth,
+        context,
+    }
 }
 
 #[cfg(test)]
@@ -370,18 +429,24 @@ mod tests {
 
     use super::*;
     use crate::{
-        answer::testutils::{
-            make_repository_service, FakeChatCompletionStream, FakeCodeSearch, FakeContextService,
-            FakeDocSearch,
+        answer::{
+            self,
+            testutils::{
+                make_repository_service, FakeChatCompletionStream, FakeCodeSearch,
+                FakeContextService, FakeDocSearch,
+            },
         },
-        service::auth,
+        event_logger::test_utils::MockEventLogger,
+        retrieval,
+        service::{auth, setting, UserSecuredExt},
     };
 
     #[tokio::test]
     async fn test_create_thread() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db, None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db, None, None, context);
 
         let input = CreateThreadInput {
             user_message: CreateMessageInput {
@@ -397,7 +462,8 @@ mod tests {
     async fn test_append_messages() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db, None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db, None, None, context);
 
         let thread_id = service
             .create(
@@ -443,7 +509,8 @@ mod tests {
     async fn test_delete_thread_message_pair() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db.clone(), None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db.clone(), None, None, context);
 
         let thread_id = service
             .create(
@@ -532,7 +599,8 @@ mod tests {
     async fn test_get_thread() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db, None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db, None, None, context);
 
         let input = CreateThreadInput {
             user_message: CreateMessageInput {
@@ -556,7 +624,8 @@ mod tests {
     async fn test_delete_thread() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db.clone(), None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db.clone(), None, None, context);
 
         let input = CreateThreadInput {
             user_message: CreateMessageInput {
@@ -583,7 +652,8 @@ mod tests {
     async fn test_set_persisted() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db.clone(), None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db.clone(), None, None, context);
 
         let input = CreateThreadInput {
             user_message: CreateMessageInput {
@@ -617,7 +687,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_run() {
         let db = DbConn::new_in_memory().await.unwrap();
-        let user_id = create_user(&db).await.as_id();
+        let user_id = create_user(&db).await;
+        let user = UserSecured::new(db.clone(), db.get_user(user_id).await.unwrap().unwrap());
         let auth = Arc::new(auth::testutils::FakeAuthService::new(vec![]));
         let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream {
             return_error: false,
@@ -628,17 +699,24 @@ mod tests {
         let serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
         let config = make_answer_config();
         let repo = make_repository_service(db.clone()).await.unwrap();
-        let answer_service = Arc::new(crate::answer::create(
-            &config,
-            auth.clone(),
-            chat.clone(),
+        let settings = Arc::new(setting::create(db.clone()));
+        let retrieval = Arc::new(retrieval::create(
             code.clone(),
             doc.clone(),
-            context.clone(),
             serper,
             repo,
+            settings,
         ));
-        let service = create(db.clone(), Some(answer_service), None);
+        let logger = Arc::new(MockEventLogger {});
+        let answer_service = Arc::new(answer::create(
+            logger,
+            &config,
+            auth,
+            chat,
+            retrieval,
+            context.clone(),
+        ));
+        let service = create(db.clone(), Some(answer_service), None, context);
 
         let input = CreateThreadInput {
             user_message: CreateMessageInput {
@@ -647,13 +725,12 @@ mod tests {
             },
         };
 
-        let thread_id = service.create(&user_id, &input).await.unwrap();
+        let thread_id = service.create(&user.id, &input).await.unwrap();
 
-        let policy = AccessPolicy::new(db.clone(), &user_id, false);
         let options = ThreadRunOptionsInput::default();
 
         let run_stream = service
-            .create_run(&policy, &thread_id, &options, None, true, true)
+            .create_run(&user, &thread_id, &options, None, true, true)
             .await;
 
         assert!(run_stream.is_ok());
@@ -663,7 +740,8 @@ mod tests {
     async fn test_list_threads() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = create_user(&db).await.as_id();
-        let service = create(db, None, None);
+        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
+        let service = create(db, None, None, context);
 
         for i in 0..3 {
             let input = CreateThreadInput {

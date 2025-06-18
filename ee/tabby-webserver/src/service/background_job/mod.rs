@@ -3,7 +3,10 @@ mod db;
 mod git;
 mod helper;
 mod hourly;
+mod index_commits;
 mod index_garbage_collection;
+mod index_ingestion;
+mod index_pages;
 mod license_check;
 mod third_party_integration;
 mod web_crawler;
@@ -17,6 +20,8 @@ use git::SchedulerGitJob;
 use helper::{CronStream, Job, JobLogger};
 use hourly::HourlyJob;
 use index_garbage_collection::IndexGarbageCollection;
+use index_ingestion::SyncIngestionIndexJob;
+use index_pages::SyncPageIndexJob;
 use juniper::ID;
 use license_check::LicenseCheckJob;
 use serde::{Deserialize, Serialize};
@@ -25,15 +30,19 @@ use tabby_db::DbConn;
 use tabby_inference::Embedding;
 use tabby_schema::{
     context::ContextService,
+    ingestion::IngestionService,
     integration::IntegrationService,
     job::JobService,
     license::LicenseService,
     notification::{NotificationRecipient, NotificationService},
+    page::PageService,
     repository::{GitRepositoryService, RepositoryService, ThirdPartyRepositoryService},
     AsID,
 };
+pub use third_party_integration::error::octocrab_error_message;
 use third_party_integration::SchedulerGithubGitlabJob;
 use tracing::{debug, warn};
+use url::Url;
 pub use web_crawler::WebCrawlerJob;
 
 use self::third_party_integration::SyncIntegrationJob;
@@ -45,6 +54,8 @@ pub enum BackgroundJobEvent {
     SyncThirdPartyRepositories(ID),
     WebCrawler(WebCrawlerJob),
     IndexGarbageCollection,
+    SyncIngestionIndex,
+    SyncPagesIndex,
     Hourly,
     Daily,
 }
@@ -57,8 +68,10 @@ impl BackgroundJobEvent {
                 SchedulerGithubGitlabJob::NAME
             }
             BackgroundJobEvent::SyncThirdPartyRepositories(_) => SyncIntegrationJob::NAME,
+            BackgroundJobEvent::SyncPagesIndex => SyncPageIndexJob::NAME,
             BackgroundJobEvent::WebCrawler(_) => WebCrawlerJob::NAME,
             BackgroundJobEvent::IndexGarbageCollection => IndexGarbageCollection::NAME,
+            BackgroundJobEvent::SyncIngestionIndex => SyncIngestionIndexJob::NAME,
             BackgroundJobEvent::Hourly => HourlyJob::NAME,
             BackgroundJobEvent::Daily => DailyJob::NAME,
         }
@@ -69,26 +82,85 @@ impl BackgroundJobEvent {
     }
 }
 
-fn background_job_notification_name(event: &BackgroundJobEvent) -> &str {
+async fn background_job_notification_name(
+    integration_service: Arc<dyn IntegrationService>,
+    third_party_repository_service: Arc<dyn ThirdPartyRepositoryService>,
+    event: &BackgroundJobEvent,
+) -> String {
     match event {
-        BackgroundJobEvent::SchedulerGitRepository(_) => "Indexing Repository",
-        BackgroundJobEvent::SchedulerGithubGitlabRepository(_) => "Indexing Repository",
-        BackgroundJobEvent::SyncThirdPartyRepositories(_) => "Loading Repository",
-        BackgroundJobEvent::WebCrawler(_) => "Web Indexing",
-        BackgroundJobEvent::IndexGarbageCollection => "Garbage Collection",
-        BackgroundJobEvent::Hourly => "Hourly",
-        BackgroundJobEvent::Daily => "Daily",
+        BackgroundJobEvent::SchedulerGitRepository(repo) => {
+            if let Ok(url) = Url::parse(&repo.git_url) {
+                format!(
+                    "Indexing Git Repository {}",
+                    url.path()
+                        .strip_suffix(".git")
+                        .unwrap_or_else(|| url.path())
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                )
+            } else {
+                repo.git_url.clone()
+            }
+        }
+        BackgroundJobEvent::SchedulerGithubGitlabRepository(id) => {
+            if let Ok(repo) = third_party_repository_service
+                .get_provided_repository(id)
+                .await
+            {
+                format!(
+                    "Indexing {} Repository {}",
+                    integration_service
+                        .get_integration(&repo.integration_id)
+                        .await
+                        .map(|integration| integration.display_name)
+                        .unwrap_or_else(|_| String::new()),
+                    repo.display_name
+                )
+            } else {
+                format!("Indexing Third Party Repository {}", id)
+            }
+        }
+        BackgroundJobEvent::SyncThirdPartyRepositories(id) => {
+            if let Ok(repo) = integration_service.get_integration(id).await {
+                format!("Loading {} Repositories", repo.display_name)
+            } else {
+                format!("Loading Third Party Repositories {}", id)
+            }
+        }
+        BackgroundJobEvent::SyncPagesIndex => "Pages Indexing".into(),
+        BackgroundJobEvent::WebCrawler(doc) => {
+            if let Ok(url) = Url::parse(&doc.url) {
+                format!(
+                    "Indexing Web {}",
+                    url.host_str().unwrap_or_else(|| &doc.url)
+                )
+            } else {
+                format!("Indexing Web {}", doc.url)
+            }
+        }
+        BackgroundJobEvent::SyncIngestionIndex => "Ingestion Indexing".into(),
+        BackgroundJobEvent::IndexGarbageCollection => "Index Garbage Collection".into(),
+        BackgroundJobEvent::Hourly => "Hourly".into(),
+        BackgroundJobEvent::Daily => "Daily".into(),
     }
 }
 
 async fn notify_job_error(
     notification_service: Arc<dyn NotificationService>,
+    integration_service: Arc<dyn IntegrationService>,
+    third_party_repository_service: Arc<dyn ThirdPartyRepositoryService>,
     err: &str,
     event: &BackgroundJobEvent,
     id: i64,
 ) {
     warn!("job {:?} failed: {:?}", event, err);
-    let name = background_job_notification_name(event);
+    let name = background_job_notification_name(
+        integration_service,
+        third_party_repository_service,
+        event,
+    )
+    .await;
     if let Err(err) = notification_service
         .create(
             NotificationRecipient::Admin,
@@ -113,7 +185,9 @@ pub async fn start(
     git_repository_service: Arc<dyn GitRepositoryService>,
     third_party_repository_service: Arc<dyn ThirdPartyRepositoryService>,
     integration_service: Arc<dyn IntegrationService>,
+    ingestion_service: Arc<dyn IngestionService>,
     repository_service: Arc<dyn RepositoryService>,
+    page_service: Option<Arc<dyn PageService>>,
     context_service: Arc<dyn ContextService>,
     license_service: Arc<dyn LicenseService>,
     notification_service: Arc<dyn NotificationService>,
@@ -125,6 +199,10 @@ pub async fn start(
 
     let mut daily = CronStream::new(Schedule::from_str("@daily").expect("Invalid cron expression"))
         .into_stream();
+
+    let mut ten_seconds =
+        CronStream::new(Schedule::from_str("*/10 * * * * *").expect("Invalid cron expression"))
+            .into_stream();
 
     tokio::spawn(async move {
         loop {
@@ -140,7 +218,13 @@ pub async fn start(
                         continue;
                     }
 
-                    let logger = JobLogger::new(db.clone(), job.id);
+                    let logger = match JobLogger::new(db.clone(), job.id) {
+                        Ok(logger) => logger,
+                        Err(err) => {
+                            warn!("Failed to create job logger: {:?}", err);
+                            continue;
+                        }
+                    };
                     debug!("Background job {} started, command: {}", job.id, job.command);
                     let Ok(event) = serde_json::from_str::<BackgroundJobEvent>(&job.command) else {
                         logkit::info!(exit_code = -1; "Failed to parse background job event, marking it as failed");
@@ -161,24 +245,52 @@ pub async fn start(
                             let job = SchedulerGithubGitlabJob::new(integration_id);
                             job.run(embedding.clone(), third_party_repository_service.clone(), integration_service.clone()).await
                         }
+                        BackgroundJobEvent::SyncPagesIndex => {
+                            if let Some(page_service) = page_service.clone() {
+                                let job = SyncPageIndexJob;
+                                job.run(
+                                    page_service.clone(),
+                                    embedding.clone(),
+                                ).await
+                            } else {
+                                logkit::info!(exit_code = -1; "No page service available, skipping SyncPagesIndex job");
+                                Ok(())
+                            }
+                        }
                         BackgroundJobEvent::WebCrawler(job) => {
                             job.run(embedding.clone()).await
                         }
                         BackgroundJobEvent::IndexGarbageCollection => {
                             let job = IndexGarbageCollection;
-                            job.run(repository_service.clone(), context_service.clone()).await
+                            job.run(repository_service.clone(), context_service.clone(), ingestion_service.clone()).await
+                        }
+                        BackgroundJobEvent::SyncIngestionIndex => {
+                            let job = SyncIngestionIndexJob;
+                            job.run(
+                                ingestion_service.clone(),
+                                embedding.clone(),
+                            ).await
                         }
                         BackgroundJobEvent::Hourly => {
                             let job = HourlyJob;
-                            job.run(
+                            if let Err(e) = job.run(
                                 db.clone(),
                                 context_service.clone(),
                                 git_repository_service.clone(),
                                 job_service.clone(),
+                                ingestion_service.clone(),
                                 integration_service.clone(),
                                 third_party_repository_service.clone(),
                                 repository_service.clone(),
-                            ).await
+                            ).await {
+                                logkit::warn!("Hourly job failed: {:?}", e);
+                            };
+
+                            if let Err(e) = SyncPageIndexJob::cron(job_service.clone()).await {
+                                logkit::warn!("Sync page index job failed: {:?}", e);
+                            };
+
+                            Ok(())
                         }
                         BackgroundJobEvent::Daily => {
                             let job = DailyJob;
@@ -189,7 +301,7 @@ pub async fn start(
                         }
                     } {
                         logkit::info!(exit_code = 1; "Job failed {}", err);
-                        notify_job_error(notification_service.clone(), &err.to_string(), &cloned_event, job.id).await;
+                        notify_job_error(notification_service.clone(), integration_service.clone(), third_party_repository_service.clone(), &err.to_string(), &cloned_event, job.id).await;
                     } else {
                         logkit::info!(exit_code = 0; "Job completed successfully");
                     }
@@ -206,6 +318,13 @@ pub async fn start(
                     match job_service.trigger(BackgroundJobEvent::Daily.to_command()).await {
                         Err(err) => warn!("Daily background job schedule failed {}", err),
                         Ok(id) => debug!("Daily background job {} scheduled", id),
+                    }
+                }
+                Some(_) = ten_seconds.next() => {
+                    match SyncIngestionIndexJob::cron(job_service.clone(), ingestion_service.clone()).await {
+                        Err(err) => warn!("Schedule ingestion job failed: {}", err),
+                        Ok(true) => debug!("Ingestion job scheduled"),
+                        Ok(false) => {},
                     }
                 }
                 else => {

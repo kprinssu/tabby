@@ -5,7 +5,7 @@ use async_stream::stream;
 use futures::{stream::BoxStream, Stream, StreamExt};
 use serde_json::json;
 use tabby_common::{
-    index::{IndexSchema, FIELD_SOURCE_ID},
+    index::{structured_doc::fields::KIND, IndexSchema, FIELD_SOURCE_ID},
     path,
 };
 use tantivy::{
@@ -17,8 +17,8 @@ use tantivy::{
     collector::TopDocs,
     doc,
     query::AllQuery,
-    schema::{self, Value},
-    DocAddress, DocSet, IndexWriter, Searcher, TantivyDocument, Term, TERMINATED,
+    schema::{self, document::CompactDocValue, Value},
+    DateTime, DocAddress, DocSet, IndexWriter, Searcher, TantivyDocument, Term, TERMINATED,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, warn};
@@ -118,7 +118,7 @@ impl<T: ToIndexId> TantivyDocBuilder<T> {
 
             yield tokio::spawn(async move {
                 let mut failed_count = 0;
-                while let Some(_) = rx.recv().await {
+                while (rx.recv().await).is_some() {
                     failed_count += 1;
                 }
                 if failed_count > 0 {
@@ -236,6 +236,69 @@ impl Indexer {
             .map_err(|e| e.into())
     }
 
+    // `get_doc_kind` returns the kind of a structured_doc, and `None` for a code.
+    pub async fn get_doc_kind<'a>(&self, id: &str) -> Result<Option<String>> {
+        let doc = self.get_doc(id).await?;
+        let schema = IndexSchema::instance();
+        Ok(get_json_text_optional(&doc, schema.field_attributes, KIND).map(|v| v.to_owned()))
+    }
+
+    /// Lists the latest document IDs based on the given source ID, key-value pairs, and datetime field.
+    ///
+    /// The IDs are sorted by the datetime field in descending order and filtered by the given constraints.
+    pub async fn list_latest_ids(
+        &self,
+        source_id: &str,
+        kvs: &Vec<(&str, &str)>,
+        datetime_field: &str,
+        offset: usize,
+    ) -> Result<Vec<String>> {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_with_attribute_field(&self.corpus, source_id, kvs);
+        let docs = match self
+            .searcher
+            .search(&query, &TopDocs::with_limit(u16::MAX as usize))
+        {
+            Ok(docs) => docs,
+            Err(e) => {
+                debug!("query tantivy error: {}", e);
+                return Err(e.into());
+            }
+        };
+        if docs.is_empty() {
+            bail!("No document found: {:?}", kvs);
+        }
+
+        let mut documents = Vec::new();
+        for (_, doc_address) in docs {
+            let doc: TantivyDocument = self.searcher.doc(doc_address)?;
+            documents.push((
+                get_text(&doc, schema.field_id).to_owned(),
+                get_json_date_field(&doc, schema.field_attributes, datetime_field),
+            ));
+        }
+
+        documents.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(documents
+            .iter()
+            .skip(offset)
+            .map(|(id, _)| id.to_owned())
+            .collect())
+    }
+
+    pub async fn count_doc_by_attribute(
+        &self,
+        source_id: &str,
+        kvs: &Vec<(&str, &str)>,
+    ) -> Result<usize> {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_with_attribute_field(&self.corpus, source_id, kvs);
+
+        let count = self.searcher.search(&query, &tantivy::collector::Count)?;
+        Ok(count)
+    }
+
     pub fn delete(&self, id: &str) {
         let schema = IndexSchema::instance();
         let _ = self
@@ -268,7 +331,7 @@ impl Indexer {
     }
 
     /// Iterates over all the document IDs in the corpus.
-    pub fn iter_ids(&self) -> impl Stream<Item = String> + '_ {
+    pub fn iter_ids(&self) -> impl Stream<Item = (String, String)> + '_ {
         let schema = IndexSchema::instance();
 
         stream! {
@@ -292,7 +355,8 @@ impl Indexer {
                         // Skip chunks, as we only want to iterate over the main docs
                         if doc.get_first(schema.field_chunk_id).is_none() {
                             let id = get_text(&doc, schema.field_id);
-                            yield id.to_owned();
+                            let source = get_text(&doc, schema.field_source_id);
+                            yield (source.to_owned(), id.to_owned());
                         }
                     }
                     doc_id = postings.advance();
@@ -422,4 +486,43 @@ fn get_date(doc: &TantivyDocument, field: schema::Field) -> tantivy::DateTime {
 
 fn get_number_optional(doc: &TantivyDocument, field: schema::Field) -> Option<i64> {
     doc.get_first(field)?.as_i64()
+}
+
+fn get_json_field<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> CompactDocValue<'a> {
+    doc.get_first(field)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .find(|(k, _)| *k == name)
+        .unwrap()
+        .1
+}
+
+fn get_json_date_field(doc: &TantivyDocument, field: schema::Field, name: &str) -> DateTime {
+    get_json_field(doc, field, name).as_datetime().unwrap()
+}
+
+fn get_json_field_optional<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> Option<CompactDocValue<'a>> {
+    Some(
+        doc.get_first(field)?
+            .as_object()?
+            .find(|(k, _)| *k == name)?
+            .1,
+    )
+}
+
+fn get_json_text_optional<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> Option<&'a str> {
+    get_json_field_optional(doc, field, name).map(|v| v.as_str().unwrap())
 }

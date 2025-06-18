@@ -26,6 +26,7 @@ import com.intellij.openapi.progress.util.BackgroundTaskUtil
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.util.SystemInfo
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
@@ -80,7 +81,10 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
   private suspend fun getServer() = project.serviceOrNull<ConnectionService>()?.getServerAsync()
 
   private var currentConfig: Config.ServerConfig? = null
-  private var isChatPanelLoaded = false
+  var isChatPanelLoaded = false
+    private set
+  var chatPanelAPIVersion: String? = null
+    private set
   private val pendingScripts: MutableList<String> = mutableListOf()
 
   init {
@@ -89,8 +93,8 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     component.background = bgColor
     setPageBackgroundColor("hsl(${bgColor.toHsl()})")
 
-    val tabbyThreadsScript = loadTabbyThreadsScript()
-    val htmlContent = loadHtmlContent(tabbyThreadsScript)
+    val tabbyChatPanelScript = loadTabbyChatPanelScript()
+    val htmlContent = loadHtmlContent(tabbyChatPanelScript)
     loadHTML(htmlContent)
 
     jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
@@ -138,6 +142,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
         }
       }
     })
+
     messageBusConnection.subscribe(EditorColorsManager.TOPIC, EditorColorsListener {
       BackgroundTaskUtil.executeOnPooledThread(this) {
         logger.debug("EditorColorsManager globalSchemeChange received, updating style.")
@@ -146,6 +151,10 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
         chatPanelUpdateTheme()
       }
     })
+  }
+
+  fun navigate(view: String) {
+    chatPanelNavigate(view)
   }
 
   fun explainSelectedText() {
@@ -161,6 +170,12 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     }
   }
 
+  fun codeReviewSelectedText() {
+    BackgroundTaskUtil.executeOnPooledThread(this) {
+      chatPanelExecuteCommand(ChatCommand.CODE_REVIEW)
+    }
+  }
+
   fun generateDocsForSelectedText() {
     BackgroundTaskUtil.executeOnPooledThread(this) {
       chatPanelExecuteCommand(ChatCommand.GENERATE_DOCS)
@@ -173,21 +188,86 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     }
   }
 
-  fun addActiveEditorAsContext(useSelectedText: Boolean) {
+  // default: use selection if available, otherwise use the whole file
+  // selection: use selection if available, otherwise return null
+  // file: use the whole file
+  enum class RangeStrategy {
+    DEFAULT, SELECTION, FILE
+  }
+
+  fun addActiveEditorAsContext(rangeStrategy: RangeStrategy = RangeStrategy.DEFAULT) {
     BackgroundTaskUtil.executeOnPooledThread(this) {
-      val context = getActiveEditorFileContext(useSelectedText) ?: return@executeOnPooledThread
+      val context = getActiveEditorFileContext(rangeStrategy) ?: return@executeOnPooledThread
       chatPanelAddRelevantContext(context)
     }
   }
 
-  private fun getActiveEditorFileContext(useSelectedText: Boolean = true): EditorFileContext? {
+  private fun virtualFileToFilepath(virtualFile: VirtualFile): Filepath {
+    val uri = virtualFile.url
+
+    val workspaceDir = project.guessProjectDir()?.url
+    val gitRepo = gitProvider.getRepository(uri)
+    val gitUrl = gitRepo?.let { getDefaultRemoteUrl(it) }
+
+    return if (gitUrl != null && uri.startsWith(gitRepo.root)) {
+      val relativePath = uri.substringAfter(gitRepo.root).trimStart(File.separatorChar)
+      FilepathInGitRepository(
+        filepath = relativePath,
+        gitUrl = gitUrl,
+      )
+    } else if (workspaceDir != null && uri.startsWith(workspaceDir)) {
+      FilepathInWorkspace(
+        filepath = uri.substringAfter(workspaceDir).trimStart(File.separatorChar),
+        baseDir = workspaceDir,
+      )
+    } else {
+      FilepathUri(uri = uri)
+    }
+  }
+
+  private fun findVirtualFile(filepath: Filepath): VirtualFile? {
+    return when (filepath.kind) {
+      Filepath.Kind.URI -> {
+        val filepathUri = filepath as FilepathUri
+        project.findVirtualFile(filepathUri.uri) ?: project.guessProjectDir()?.url?.let {
+          project.findVirtualFile(it.appendUrlPathSegments(filepathUri.uri))
+        }
+      }
+
+      Filepath.Kind.WORKSPACE -> {
+        val filepathInWorkspace = filepath as FilepathInWorkspace
+        filepathInWorkspace.baseDir.let {
+          project.findVirtualFile(it.appendUrlPathSegments(filepathInWorkspace.filepath))
+        } ?: project.guessProjectDir()?.url?.let {
+          project.findVirtualFile(it.appendUrlPathSegments(filepathInWorkspace.filepath))
+        }
+      }
+
+      Filepath.Kind.GIT -> {
+        val filepathInGit = filepath as FilepathInGitRepository
+        gitRemoteUrlToLocalRoot[filepathInGit.gitUrl]?.let {
+          project.findVirtualFile(it.appendUrlPathSegments(filepathInGit.filepath))
+        } ?: project.guessProjectDir()?.url?.let {
+          project.findVirtualFile(it.appendUrlPathSegments(filepathInGit.filepath))
+        }
+      }
+
+      else -> {
+        null
+      }
+    }
+  }
+
+  private fun getActiveEditorFileContext(rangeStrategy: RangeStrategy = RangeStrategy.DEFAULT): EditorFileContext? {
     val editor = fileEditorManager.selectedTextEditor ?: return null
-    val uri = editor.virtualFile?.url ?: return null
+    val virtualFile = editor.virtualFile ?: return null
 
     val context = runReadAction {
       val document = editor.document
+      val selectionModel = editor.selectionModel
+      val useSelectedText = rangeStrategy == RangeStrategy.SELECTION
+          || (rangeStrategy == RangeStrategy.DEFAULT && selectionModel.hasSelection())
       if (useSelectedText) {
-        val selectionModel = editor.selectionModel
         val text = selectionModel.selectedText.takeUnless { it.isNullOrBlank() } ?: return@runReadAction null
         Pair(
           text,
@@ -205,19 +285,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       }
     } ?: return null
 
-    val gitRepo = gitProvider.getRepository(uri)
-    val gitUrl = gitRepo?.let { getDefaultRemoteUrl(it) }
-
-    val filepath = if (gitUrl != null && uri.startsWith(gitRepo.root)) {
-      val relativePath = uri.substringAfter(gitRepo.root).trimStart(File.separatorChar)
-      FilepathInGitRepository(
-        filepath = relativePath,
-        gitUrl = gitUrl,
-      )
-    } else {
-      FilepathUri(uri = uri)
-    }
-
+    val filepath = virtualFileToFilepath(virtualFile)
     val editorFileContext = EditorFileContext(
       filepath = filepath,
       range = context.second,
@@ -230,24 +298,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
 
   private fun openInEditor(fileLocation: FileLocation): Boolean {
     val filepath = fileLocation.filepath
-    val virtualFile = when (filepath.kind) {
-      Filepath.Kind.URI -> {
-        val filepathUri = filepath as FilepathUri
-        project.findVirtualFile(filepathUri.uri)
-      }
-
-      Filepath.Kind.GIT -> {
-        val filepathInGit = filepath as FilepathInGitRepository
-        val gitLocalRoot = gitRemoteUrlToLocalRoot[filepathInGit.gitUrl]
-        gitLocalRoot?.let {
-          project.findVirtualFile(it.appendUrlPathSegments(filepathInGit.filepath))
-        }
-      }
-
-      else -> {
-        null
-      }
-    } ?: return false
+    val virtualFile = findVirtualFile(filepath) ?: return false
 
     val position = when (val location = fileLocation.location) {
       is Number -> {
@@ -285,7 +336,6 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
 
   private fun handleLoaded() {
     jsInjectFunctions()
-    jsCreateChatPanelClient()
     jsApplyStyle()
     reloadContent()
     component.isVisible = true
@@ -299,29 +349,36 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       ?: if (isDarkTheme) editorColorsScheme.defaultBackground.brighter() else editorColorsScheme.defaultBackground.darker()
   }
 
+  @Suppress("UnnecessaryVariable", "UseJBColor")
   private fun buildCss(): String {
     val editorColorsScheme = EditorColorsManager.getInstance().schemeForCurrentUITheme
+    val componentBgColor = calcComponentBgColor()
     val bgColor = editorColorsScheme.defaultBackground
-    val bgActiveColor = calcComponentBgColor()
     val fgColor = editorColorsScheme.defaultForeground
-    val borderColor = if (isDarkTheme) JBColor.DARK_GRAY else JBColor.LIGHT_GRAY
+    val borderColor = if (isDarkTheme) JBColor.DARK_GRAY.darker() else JBColor.LIGHT_GRAY
+    val inputColor = componentBgColor
     val inputBorderColor = borderColor
 
     val primaryColor = editorColorsScheme.getAttributes(EditorColors.REFERENCE_HYPERLINK_COLOR).foregroundColor
       ?: if (isDarkTheme) Color(55, 148, 255) else Color(26, 133, 255)
-    val primaryFgColor = JBColor.WHITE
-    val popoverColor = bgActiveColor
+    val primaryFgColor = Color.WHITE
+    val popoverColor = componentBgColor
     val popoverFgColor = fgColor
-    val accentColor = if (isDarkTheme) Color(4, 57, 94) else bgActiveColor.interpolate(bgActiveColor.darker(), 0.2)
+    val accentColor =
+      if (isDarkTheme) Color(4, 57, 94) else componentBgColor.interpolate(componentBgColor.darker(), 0.2)
     val accentFgColor = fgColor
+
+    val ringColor = primaryColor
 
     val font = editorColorsScheme.getFont(EditorFontType.PLAIN).fontName
     val fontSize = editorColorsScheme.editorFontSize
-    val css = String.format("background-color: hsl(%s);", bgActiveColor.toHsl()) +
+    val css = String.format("--sidebar-background: %s;", componentBgColor.toHsl()) +
         String.format("--background: %s;", bgColor.toHsl()) +
         String.format("--foreground: %s;", fgColor.toHsl()) +
         String.format("--border: %s;", borderColor.toHsl()) +
-        String.format("--input: %s;", inputBorderColor.toHsl()) +
+        String.format("--input: %s;", inputColor.toHsl()) +
+        String.format("--input-border: %s;", inputBorderColor.toHsl()) +
+        String.format("--ring: %s;", ringColor.toHsl()) +
         String.format("--primary: %s;", primaryColor.toHsl()) +
         String.format("--primary-foreground: %s;", primaryFgColor.toHsl()) +
         String.format("--popover: %s;", popoverColor.toHsl()) +
@@ -338,6 +395,8 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     if (force) {
       scope.launch {
         val server = getServer() ?: return@launch
+        reloadContentInternal(StatusInfo(StatusInfo.Status.CONNECTING))
+        delay(500) // make the loading indicator visible for a bit
         server.statusFeature.getStatus(StatusRequestParams(recheckConnection = true)).thenAccept {
           reloadContentInternal(it, true)
         }
@@ -349,18 +408,22 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
 
   private fun reloadContentInternal(statusInfo: StatusInfo?, force: Boolean = false) {
     if (statusInfo == null) {
+      currentConfig = null
       showContent("Initializing...")
     } else {
       when (statusInfo.status) {
         StatusInfo.Status.CONNECTING -> {
+          currentConfig = null
           showContent("Connecting to Tabby server...")
         }
 
         StatusInfo.Status.UNAUTHORIZED -> {
+          currentConfig = null
           showContent("Authorization required, please set your token in settings.")
         }
 
         StatusInfo.Status.DISCONNECTED -> {
+          currentConfig = null
           showContent("Cannot connect to Tabby server, please check your settings.")
         }
 
@@ -368,16 +431,19 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
           val health = statusInfo.serverHealth
           val error = checkServerHealth(health)
           if (error != null) {
+            currentConfig = null
             showContent(error)
           } else {
             val config = combinedState.state.agentConfig?.server
             if (config == null) {
+              currentConfig = null
               showContent("Initializing...")
             } else if (force || currentConfig != config) {
               showContent("Loading chat panel...")
               isChatPanelLoaded = false
               currentConfig = config
               jsLoadChatPanel()
+              jsCreateChatPanelClient()
             }
           }
         }
@@ -407,20 +473,20 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
         )
       )
     logger.debug("chatPanelInit: $params")
-    jsChatPanelClientInvoke("init", params)
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "init", params)
   }
 
   private fun chatPanelExecuteCommand(command: String) {
     val params = listOf(command)
     logger.debug("chatPanelExecuteCommand: $params")
-    jsChatPanelClientInvoke("executeCommand", params)
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "executeCommand", params)
   }
 
   private fun chatPanelAddRelevantContext(context: EditorFileContext) {
     val params = listOf(context)
 
     logger.debug("chatPanelAddRelevantContext: $params")
-    jsChatPanelClientInvoke("addRelevantContext", params)
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "addRelevantContext", params)
   }
 
   private fun chatPanelUpdateTheme() {
@@ -430,13 +496,19 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
         if (isDarkTheme) "dark" else "light",
       )
     logger.debug("chatPanelUpdateTheme: $params")
-    jsChatPanelClientInvoke("updateTheme", params)
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "updateTheme", params)
   }
 
   private fun chatPanelUpdateActiveSelection(context: EditorFileContext?) {
     val params = listOf(context)
     logger.debug("chatPanelUpdateActiveSelection: $params")
-    jsChatPanelClientInvoke("updateActiveSelection", params)
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "updateActiveSelection", params)
+  }
+
+  private fun chatPanelNavigate(view: String) {
+    val params = listOf(view)
+    logger.debug("chatPanelNavigate: $params")
+    jsChatPanelClientInvoke(ChatPanelApiVersion.V0_8_0, "navigate", params)
   }
 
   // js handler functions to inject
@@ -464,6 +536,17 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     """.trimIndent().trimStart()
   }
 
+  private val jsHandleChatPanelClientCreated = createJsFunction { params ->
+    logger.debug("chatPanelClientCreated: $params")
+    isChatPanelLoaded = true
+    chatPanelAPIVersion = params.getOrNull(0) as String?
+    pendingScripts.forEach { executeJs(it) }
+    pendingScripts.clear()
+    chatPanelInit()
+    chatPanelUpdateTheme()
+    showContent()
+  }
+
   private val jsReloadContent = createJsFunction { reloadContent(true) }
 
   private val jsHandleChatPanelRefresh = createJsFunction {
@@ -485,36 +568,12 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     }
   }
 
-  private val jsHandleChatPanelOnLoaded = createJsFunction { params ->
-    logger.debug("onLoaded: $params")
-    val onLoadedParams = params.getOrNull(0) as Map<*, *>?
-    val apiVersion = onLoadedParams?.get("apiVersion") as String?
-    if (apiVersion != null) {
-      val error = checkChatPanelApiVersion(apiVersion)
-      if (error != null) {
-        showContent(error)
-        return@createJsFunction Unit
-      }
-    }
-    isChatPanelLoaded = true
-    pendingScripts.forEach { executeJs(it) }
-    pendingScripts.clear()
-    chatPanelInit()
-    chatPanelUpdateTheme()
-    showContent()
-  }
-
   private val jsHandleChatPanelOnCopy = createJsFunction { params ->
     logger.debug("onCopy: request: $params")
     val content = params.getOrNull(0) as String? ?: return@createJsFunction Unit
     val stringSelection = StringSelection(content)
     val clipboard = Toolkit.getDefaultToolkit().systemClipboard
     clipboard.setContents(stringSelection, null)
-  }
-
-  private val jsHandleChatPanelOnKeyboardEvent = createJsFunction { params ->
-    logger.debug("onKeyboardEvent: request: $params")
-    // nothing to do
   }
 
   private val jsHandleChatPanelOpenInEditor = createJsFunction { params ->
@@ -562,27 +621,6 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     executeJs(script)
   }
 
-  private fun jsCreateChatPanelClient() {
-    val script = """
-      if (!window.tabbyChatPanelClient) {
-        window.tabbyChatPanelClient = TabbyThreads.createThreadFromIframe(getChatPanel(), {
-          expose: {
-            refresh: $jsHandleChatPanelRefresh,
-            onApplyInEditor: $jsHandleChatPanelOnApplyInEditor,
-            onLoaded: $jsHandleChatPanelOnLoaded,
-            onCopy: $jsHandleChatPanelOnCopy,
-            onKeyboardEvent: $jsHandleChatPanelOnKeyboardEvent,
-            openInEditor: $jsHandleChatPanelOpenInEditor,
-            openExternal: $jsHandleChatPanelOpenExternal,
-            readWorkspaceGitRepositories: $jsHandleChatPanelReadWorkspaceGitRepositories,
-            getActiveEditorSelection: $jsHandleChatPanelGetActiveEditorSelection,
-          }
-        })
-      }
-    """.trimIndent().trimStart()
-    executeJs(script)
-  }
-
   private fun jsApplyStyle() {
     val script = String.format(
       "applyStyle('%s')",
@@ -608,6 +646,33 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     executeJs(script)
   }
 
+  private fun jsCreateChatPanelClient() {
+    val script = """
+      TabbyChatPanel.createClient(getChatPanel(), {
+        refresh: $jsHandleChatPanelRefresh,
+        onApplyInEditor: $jsHandleChatPanelOnApplyInEditor,
+        onCopy: $jsHandleChatPanelOnCopy,
+        openInEditor: $jsHandleChatPanelOpenInEditor,
+        openExternal: $jsHandleChatPanelOpenExternal,
+        readWorkspaceGitRepositories: $jsHandleChatPanelReadWorkspaceGitRepositories,
+        getActiveEditorSelection: $jsHandleChatPanelGetActiveEditorSelection,
+      }).then((client) => {
+        window.tabbyChatPanelClient = client;
+        const getVersion = client && client['0.9.0'] && client['0.9.0']['getVersion'];
+        if (getVersion && typeof getVersion === 'function') {
+          return getVersion();
+        } else {
+          return undefined;
+        }
+      }).then((version) => {
+        console.log('Tabby Chat Panel API version: ' + version);
+        const callback = $jsHandleChatPanelClientCreated;
+        callback(version);
+      });
+    """.trimIndent().trimStart()
+    executeJs(script)
+  }
+
   private val pendingChatPanelRequest = mutableMapOf<String, CompletableFuture<Any?>>()
   private val jsChatPanelResponseHandlerInjection = JBCefJSQuery.create(this as JBCefBrowserBase).apply {
     addHandler { results ->
@@ -623,37 +688,47 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
     }
   }.inject("results")
 
-  private fun jsChatPanelClientInvoke(method: String, params: List<Any?>): CompletableFuture<Any?> {
+  private fun jsChatPanelClientInvoke(
+    version: ChatPanelApiVersion,
+    method: String,
+    params: List<Any?>
+  ): CompletableFuture<Any?> {
     val future = CompletableFuture<Any?>()
     val uuid = UUID.randomUUID().toString()
     pendingChatPanelRequest[uuid] = future
     val paramsJson = escapeCharacters(gson.toJson(params))
     val script = """
       (function() {
-        const func = window.tabbyChatPanelClient['$method']
-        if (func && typeof func === 'function') {
-          const params = JSON.parse('$paramsJson')
-          const resultPromise = func(...params)
-          if (resultPromise && typeof resultPromise.then === 'function') {
-            resultPromise.then(result => {
-              const results = JSON.stringify(['$uuid', null, result])
+        const client = window.tabbyChatPanelClient;
+        if (client && typeof client === 'object') {
+          const func = client['${version.value}'] && client['${version.value}']['$method'];
+          if (func && typeof func === 'function') {
+            const params = JSON.parse('$paramsJson')
+            const resultPromise = func(...params)
+            if (resultPromise && typeof resultPromise.then === 'function') {
+              resultPromise.then(result => {
+                const results = JSON.stringify(['$uuid', null, result])
+                $jsChatPanelResponseHandlerInjection
+              }).catch(error => {
+                const results = JSON.stringify(['$uuid', error.message, null])
+                $jsChatPanelResponseHandlerInjection
+              })
+            } else {
+              const results = JSON.stringify(['$uuid', null, resultPromise])
               $jsChatPanelResponseHandlerInjection
-            }).catch(error => {
-              const results = JSON.stringify(['$uuid', error.message, null])
-              $jsChatPanelResponseHandlerInjection
-            })
+            }
           } else {
-            const results = JSON.stringify(['$uuid', null, resultPromise])
+            const results = JSON.stringify(['$uuid', 'Function not found: $version $method', null])
             $jsChatPanelResponseHandlerInjection
           }
         } else {
-          const results = JSON.stringify(['$uuid', 'Method not found: $method', null])
+          const results = JSON.stringify(['$uuid', 'Tabby chat panel client is not connected.', null])
           $jsChatPanelResponseHandlerInjection
         }
       })()
     """.trimIndent().trimStart()
 
-    logger.debug("Request to chat panel: $uuid, $method, $paramsJson")
+    logger.debug("Request to chat panel: $uuid, $version, $method, $paramsJson")
     if (isChatPanelLoaded) {
       executeJs(script)
     } else {
@@ -663,6 +738,13 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
   }
 
   companion object {
+    private const val TABBY_SERVER_VERSION_RANGE = ">=0.27.0"
+
+    enum class ChatPanelApiVersion(val value: String) {
+      V0_8_0("0.8.0"),
+      V0_9_0("0.9.0"),
+    }
+
     private fun parseVersion(versionString: String): Version? {
       return try {
         val version = versionString.removePrefix("v").substringBefore("-")
@@ -670,15 +752,6 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       } catch (e: Exception) {
         null
       }
-    }
-
-    private fun checkChatPanelApiVersion(versionString: String): String? {
-      val version = parseVersion(versionString)
-      val range = Constraint.parse(TABBY_CHAT_PANEL_API_VERSION_RANGE)
-      if (version != null && !range.satisfiedBy(version)) {
-        return "Please update your Tabby server and Tabby plugin for IntelliJ Platform to the latest version to use chat panel."
-      }
-      return null
     }
 
     private fun checkServerHealth(serverHealth: Map<String, Any>?): String? {
@@ -728,6 +801,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       return Position(position.line + 1, position.character + 1)
     }
 
+    @Suppress("UseJBColor")
     private fun Color.interpolate(other: Color, fraction: Double): Color {
       val r = (red + (other.red - red) * fraction).toInt().coerceIn(0..255)
       val g = (green + (other.green - green) * fraction).toInt().coerceIn(0..255)
@@ -763,7 +837,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       s *= 100
       l *= 100
 
-      return String.format("%.0f, %.0f%%, %.0f%%", h, s, l)
+      return String.format("%.0f %.0f%% %.0f%%", h, s, l)
     }
 
     // FIXME: extract this to git provider
@@ -786,20 +860,17 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
       return URLBuilder(this).appendPathSegments(path).toString()
     }
 
-    private const val TABBY_CHAT_PANEL_API_VERSION_RANGE = "~0.5.0"
-    private const val TABBY_SERVER_VERSION_RANGE = ">=0.18.0"
-
-    private fun loadTabbyThreadsScript(): String {
+    private fun loadTabbyChatPanelScript(): String {
       val script =
         PluginManagerCore.getPlugin(PluginId.getId("com.tabbyml.intellij-tabby"))
           ?.pluginPath
-          ?.resolve("tabby-threads/iife/create-thread-from-iframe.js")
+          ?.resolve("tabby-chat-panel/iife/tabby-chat-panel.min.js")
           ?.toFile()
       if (script?.exists() == true) {
-        logger<ChatBrowser>().info("Tabby-threads script path: ${script.absolutePath}")
+        logger<ChatBrowser>().info("Tabby-chat-panel script path: ${script.absolutePath}")
         return script.readText()
       } else {
-        throw InitializationException("Tabby-threads script not found. Please reinstall Tabby plugin.")
+        throw InitializationException("Tabby-chat-panel script not found. Please reinstall Tabby plugin.")
       }
     }
 
@@ -827,6 +898,7 @@ class ChatBrowser(private val project: Project) : JBCefBrowser(
             display: flex;
             justify-content: center;
             align-items: flex-start;
+            font-family: ui-sans-serif, system-ui;
           }
       
           #message div {

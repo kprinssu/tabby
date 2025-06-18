@@ -1,13 +1,15 @@
+mod commit;
 mod file_search;
+mod grep;
 mod serve_git;
 
-mod grep;
 use std::path::Path;
 
 use axum::{
     body::Body,
     http::{Response, StatusCode},
 };
+pub use commit::{stream_commits, Commit};
 use file_search::GitFileSearch;
 use futures::Stream;
 pub use grep::{GrepFile, GrepLine, GrepSubMatch, GrepTextOrBase64};
@@ -19,6 +21,20 @@ pub async fn search_files(
     limit: usize,
 ) -> anyhow::Result<Vec<GitFileSearch>> {
     file_search::search(git2::Repository::open(root)?, rev, pattern, limit).await
+}
+
+pub struct ListFile {
+    pub files: Vec<GitFileSearch>,
+    pub truncated: bool,
+}
+
+pub async fn list_files(
+    root: &Path,
+    rev: Option<&str>,
+    limit: Option<usize>,
+) -> anyhow::Result<ListFile> {
+    let (files, truncated) = file_search::list(git2::Repository::open(root)?, rev, limit).await?;
+    Ok(ListFile { files, truncated })
 }
 
 pub async fn grep(

@@ -18,9 +18,9 @@ use crate::{
     path::db_file,
     routes,
     service::{
-        create_service_locator, event_logger::create_event_logger, integration, job,
-        new_auth_service, new_email_service, new_license_service, new_setting_service, repository,
-        web_documents,
+        create_service_locator, embedding, event_logger::create_event_logger, ingestion,
+        integration, job, new_auth_service, new_email_service, new_license_service,
+        new_setting_service, repository, web_documents,
     },
 };
 
@@ -82,9 +82,11 @@ impl Webserver {
         let repository = repository::create(db.clone(), integration.clone(), job.clone());
 
         let web_documents = Arc::new(web_documents::create(db.clone(), job.clone()));
+        let ingestion = Arc::new(ingestion::create(db.clone()));
 
         let context = Arc::new(crate::service::context::create(
             repository.clone(),
+            ingestion.clone(),
             web_documents.clone(),
             serper.is_some(),
         ));
@@ -107,18 +109,26 @@ impl Webserver {
             setting.clone(),
         ));
 
+        let retrieval = Arc::new(crate::service::retrieval::create(
+            code.clone(),
+            docsearch.clone(),
+            serper,
+            repository.clone(),
+            setting.clone(),
+        ));
+
         let answer = chat.as_ref().map(|chat| {
             Arc::new(crate::service::answer::create(
+                self.logger(),
                 &config.answer,
                 auth.clone(),
                 chat.clone(),
-                code.clone(),
-                docsearch.clone(),
+                retrieval.clone(),
                 context.clone(),
-                serper,
-                repository.clone(),
             ))
         });
+
+        let embedding = embedding::create(&config.embedding, self.embedding.clone());
 
         let ctx = create_service_locator(
             self.logger(),
@@ -128,15 +138,17 @@ impl Webserver {
             code.clone(),
             repository.clone(),
             integration.clone(),
+            ingestion,
             job.clone(),
             answer.clone(),
+            retrieval,
             context.clone(),
             web_documents.clone(),
             mail,
             license,
             setting,
             self.db.clone(),
-            self.embedding.clone(),
+            embedding,
         )
         .await;
 

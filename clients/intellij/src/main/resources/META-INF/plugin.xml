@@ -39,6 +39,7 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="com.tabbyml.intellijtabby.events.StartupActivity"/>
+        <postStartupActivity implementation="com.tabbyml.intellijtabby.inlineChat.SelectionGutterIconManager" />
         <editorFactoryListener implementation="com.tabbyml.intellijtabby.events.EditorFactoryListener"/>
         <statusBarWidgetFactory id="com.tabbyml.intellijtabby.status.StatusBarWidgetFactory"
                                 implementation="com.tabbyml.intellijtabby.widgets.StatusBarWidgetFactory"/>
@@ -63,6 +64,15 @@
                 anchor="right"
                 icon="com.tabbyml.intellijtabby.Icons.Chat"
                 factoryClass="com.tabbyml.intellijtabby.widgets.ChatToolWindowFactory"/>
+        <intentionAction>
+            <className>com.tabbyml.intellijtabby.inlineChat.InlineChatIntentionAction</className>
+        </intentionAction>
+        <config.codeVisionGroupSettingProvider implementation="com.tabbyml.intellijtabby.inlineChat.InlineChatCodeVisionSettingProvider"/>
+        <codeInsight.codeVisionProvider implementation="com.tabbyml.intellijtabby.inlineChat.InlineChatLoadingCodeVisionProvider" />
+        <codeInsight.codeVisionProvider implementation="com.tabbyml.intellijtabby.inlineChat.InlineChatCancelCodeVisionProvider" />
+        <codeInsight.codeVisionProvider implementation="com.tabbyml.intellijtabby.inlineChat.InlineChatAcceptCodeVisionProvider" />
+        <codeInsight.codeVisionProvider implementation="com.tabbyml.intellijtabby.inlineChat.InlineChatDiscardCodeVisionProvider" />
+        <highlightingPassFactory implementation="com.tabbyml.intellijtabby.inlineChat.DiffHighlighterRegister" />
     </extensions>
 
     <actions>
@@ -165,6 +175,12 @@
 
         <group id="Tabby.EditorContext" popup="true" text="Tabby">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <action id="Tabby.InlineChat.Open" class="com.tabbyml.intellijtabby.inlineChat.InlineChatAction"
+                    text="Open Tabby Inline Edit"
+                    description="Open a inline chat widget to chat with Tabby to modify your code.">
+                <keyboard-shortcut first-keystroke="ctrl I" keymap="$default"/>
+            </action>
+            <separator/>
             <action id="Tabby.Chat.AddSelectionToChat"
                     class="com.tabbyml.intellijtabby.actions.chat.AddSelectionToChat"
                     text="Add Selection to Chat"
@@ -185,6 +201,11 @@
                     class="com.tabbyml.intellijtabby.actions.chat.Fix"
                     text="Fix"
                     description="Fix the selected code using Tabby chat.">
+            </action>
+            <action id="Tabby.Chat.CodeReview"
+                    class="com.tabbyml.intellijtabby.actions.chat.CodeReview"
+                    text="Code Review"
+                    description="Review the selected code using Tabby chat.">
             </action>
             <action id="Tabby.Chat.GenerateDocs"
                     class="com.tabbyml.intellijtabby.actions.chat.GenerateDocs"
@@ -209,6 +230,21 @@
             <reference id="Tabby.OpenOnlineHelp"/>
         </group>
 
+        <group id="Tabby.ChatToolWindowToolbar">
+            <action id="Tabby.Chat.ShowNewChat"
+                    class="com.tabbyml.intellijtabby.actions.chat.ShowNewChat"
+                    text="New"
+                    icon="AllIcons.General.Add"
+                    description="Start a new chat.">
+            </action>
+            <action id="Tabby.Chat.ShowChatHistory"
+                    class="com.tabbyml.intellijtabby.actions.chat.ShowChatHistory"
+                    text="History"
+                    icon="AllIcons.Vcs.History"
+                    description="Show chat history.">
+            </action>
+        </group>
+
         <action id="Tabby.InlineCompletion.TabAccept"
                 class="com.tabbyml.intellijtabby.actions.inlineCompletion.TabAccept"
                 text="Accept Completion (Tab)"
@@ -221,6 +257,33 @@
                 text="Switch Focus Between Editor and Chat"
                 description="Switch focus between editor and chat, add selected text to chat if any.">
             <keyboard-shortcut first-keystroke="ctrl L" keymap="$default"/>
+        </action>
+
+        <action id="Tabby.GenerateCommitMessage"
+                class="com.tabbyml.intellijtabby.actions.GenerateCommitMessage"
+                text="Generate Commit Message"
+                description="Generate a commit message based on the changes in the current Git repository.">
+        </action>
+
+        <action id="Tabby.InlineChat.Resolve.Accept"
+                class="com.tabbyml.intellijtabby.inlineChat.InlineChatAcceptAction"
+                text="Accept Inline Edit"
+                description="Accept the inline edit suggestion.">
+            <keyboard-shortcut first-keystroke="ctrl shift D" keymap="$default"/>
+        </action>
+
+        <action id="Tabby.InlineChat.Resolve.Discard"
+                class="com.tabbyml.intellijtabby.inlineChat.InlineChatDiscardAction"
+                text="Discard Inline Edit"
+                description="Discard the inline edit suggestion.">
+            <keyboard-shortcut first-keystroke="ctrl ESCAPE" keymap="$default"/>
+        </action>
+
+        <action id="Tabby.InlineChat.Resolve.Cancel"
+                class="com.tabbyml.intellijtabby.inlineChat.InlineChatCancelAction"
+                text="Cancel Inline Edit"
+                description="Cancel the inline edit suggestion.">
+            <keyboard-shortcut first-keystroke="ctrl ESCAPE" keymap="$default"/>
         </action>
     </actions>
 </idea-plugin>

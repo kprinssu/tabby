@@ -5,6 +5,10 @@ import { graphql } from '@/lib/gql/generates'
 import {
   CreateMessageInput,
   CreateThreadRunSubscription as CreateThreadRunSubscriptionResponse,
+  Maybe,
+  ThreadAssistantMessageCompletedDebugData,
+  ThreadAssistantMessageReadingCode,
+  ThreadAssistantMessageReadingDoc,
   ThreadRunOptionsInput
 } from '../gql/generates/graphql'
 import { client, useMutation } from '../tabby/gql'
@@ -34,11 +38,21 @@ const CreateThreadAndRunSubscription = graphql(/* GraphQL */ `
       ... on ThreadAssistantMessageCreated {
         id
       }
+      ... on ThreadAssistantMessageReadingCode {
+        snippet
+        fileList
+      }
+      ... on ThreadAssistantMessageReadingDoc {
+        sourceIds
+      }
       ... on ThreadRelevantQuestions {
         questions
       }
+      ... on ThreadAssistantMessageAttachmentsCodeFileList {
+        codeFileList: fileList
+        truncated
+      }
       ... on ThreadAssistantMessageAttachmentsCode {
-        codeSourceId
         hits {
           code {
             gitUrl
@@ -86,6 +100,27 @@ const CreateThreadAndRunSubscription = graphql(/* GraphQL */ `
               body
               merged
             }
+            ... on MessageAttachmentCommitDoc {
+              sha
+              message
+              author {
+                id
+                email
+                name
+              }
+              authorAt
+            }
+            ... on MessageAttachmentPageDoc {
+              link
+              title
+              content
+            }
+            ... on MessageAttachmentIngestedDoc {
+              id
+              title
+              body
+              ingestedDocLink: link
+            }
           }
           score
         }
@@ -94,7 +129,12 @@ const CreateThreadAndRunSubscription = graphql(/* GraphQL */ `
         delta
       }
       ... on ThreadAssistantMessageCompleted {
-        id
+        debugData {
+          chatCompletionMessages {
+            role
+            content
+          }
+        }
       }
     }
   }
@@ -113,11 +153,21 @@ const CreateThreadRunSubscription = graphql(/* GraphQL */ `
       ... on ThreadAssistantMessageCreated {
         id
       }
+      ... on ThreadAssistantMessageReadingCode {
+        snippet
+        fileList
+      }
+      ... on ThreadAssistantMessageReadingDoc {
+        sourceIds
+      }
       ... on ThreadRelevantQuestions {
         questions
       }
+      ... on ThreadAssistantMessageAttachmentsCodeFileList {
+        codeFileList: fileList
+        truncated
+      }
       ... on ThreadAssistantMessageAttachmentsCode {
-        codeSourceId
         hits {
           code {
             gitUrl
@@ -165,6 +215,27 @@ const CreateThreadRunSubscription = graphql(/* GraphQL */ `
               body
               merged
             }
+            ... on MessageAttachmentCommitDoc {
+              sha
+              message
+              author {
+                id
+                email
+                name
+              }
+              authorAt
+            }
+            ... on MessageAttachmentPageDoc {
+              link
+              title
+              content
+            }
+            ... on MessageAttachmentIngestedDoc {
+              id
+              title
+              body
+              ingestedDocLink: link
+            }
           }
           score
         }
@@ -173,7 +244,12 @@ const CreateThreadRunSubscription = graphql(/* GraphQL */ `
         delta
       }
       ... on ThreadAssistantMessageCompleted {
-        id
+        debugData {
+          chatCompletionMessages {
+            role
+            content
+          }
+        }
       }
     }
   }
@@ -200,13 +276,26 @@ export interface AnswerStream {
   relevantQuestions?: Array<string>
   attachmentsCode?: ThreadAssistantMessageAttachmentCodeHits
   attachmentsDoc?: ThreadAssistantMessageAttachmentDocHits
+  attachmentsFileList?: Extract<
+    CreateThreadRunSubscriptionResponse['createThreadRun'],
+    { __typename: 'ThreadAssistantMessageAttachmentsCodeFileList' }
+  >
+  readingCode?: ThreadAssistantMessageReadingCode
+  readingDoc?: ThreadAssistantMessageReadingDoc
   content: string
+  isReadingCode: boolean
+  isReadingFileList: boolean
+  isReadingDocs: boolean
   completed: boolean
+  debugData?: Maybe<ThreadAssistantMessageCompletedDebugData>
 }
 
 const defaultAnswerStream = (): AnswerStream => ({
   content: '',
-  completed: false
+  completed: false,
+  isReadingCode: false,
+  isReadingFileList: false,
+  isReadingDocs: false
 })
 
 export interface ThreadRun {
@@ -274,21 +363,45 @@ export function useThreadRun({
       case 'ThreadRelevantQuestions':
         x.relevantQuestions = data.questions
         break
+      case 'ThreadAssistantMessageReadingCode':
+        x.isReadingCode = true
+        x.isReadingFileList = true
+        x.readingCode = {
+          fileList: data.fileList,
+          snippet: data.snippet
+        }
+        break
+      case 'ThreadAssistantMessageReadingDoc':
+        if (!!data.sourceIds.length) {
+          x.isReadingDocs = true
+        }
+        x.readingDoc = data
+        break
+      case 'ThreadAssistantMessageAttachmentsCodeFileList':
+        x.isReadingFileList = false
+        x.attachmentsFileList = data
+        break
       case 'ThreadAssistantMessageAttachmentsCode':
+        x.isReadingCode = false
         x.attachmentsCode = data.hits
-        x.codeSourceId = data.codeSourceId
         break
       case 'ThreadAssistantMessageAttachmentsDoc':
+        x.isReadingDocs = false
         x.attachmentsDoc = data.hits
         break
       case 'ThreadAssistantMessageContentDelta':
+        x.isReadingCode = false
+        x.isReadingFileList = false
+        x.isReadingDocs = false
         x.content += data.delta
         break
       case 'ThreadAssistantMessageCompleted':
+        x.debugData = data.debugData
         x.completed = true
         break
       default:
-        throw new Error('Unknown event ' + JSON.stringify(x))
+        // Ignore unknown event type.
+        break
     }
 
     return x
@@ -298,6 +411,13 @@ export function useThreadRun({
     unsubscribeFn.current?.()
     unsubscribeFn.current = undefined
     setIsLoading(false)
+    setAnswerStream(p => ({
+      ...p,
+      isReadingCode: false,
+      isReadingFileList: false,
+      isReadingDocs: false,
+      completed: true
+    }))
 
     if (!silent && threadId) {
       onAssistantMessageCompleted?.(answerStream)
@@ -399,7 +519,6 @@ export function useThreadRun({
     setIsLoading(true)
     setError(undefined)
     setAnswerStream(defaultAnswerStream())
-
     if (threadId) {
       unsubscribeFn.current = createThreadRun(userMessage, options)
     } else {

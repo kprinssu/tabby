@@ -18,7 +18,10 @@ import { toast } from 'sonner'
 import { useQuery } from 'urql'
 
 import { ERROR_CODE_NOT_FOUND, SLUG_TITLE_MAX_LENGTH } from '@/lib/constants'
-import { useEnableDeveloperMode } from '@/lib/experiment-flags'
+import {
+  useEnableDeveloperMode,
+  useEnableSearchPages
+} from '@/lib/experiment-flags'
 import { graphql } from '@/lib/gql/generates'
 import {
   CodeQueryInput,
@@ -28,7 +31,6 @@ import {
 } from '@/lib/gql/generates/graphql'
 import { useCopyToClipboard } from '@/lib/hooks/use-copy-to-clipboard'
 import { useCurrentTheme } from '@/lib/hooks/use-current-theme'
-import { useDebounceValue } from '@/lib/hooks/use-debounce'
 import { useLatest } from '@/lib/hooks/use-latest'
 import { useMe } from '@/lib/hooks/use-me'
 import { useSelectedModel } from '@/lib/hooks/use-models'
@@ -39,9 +41,10 @@ import { useThreadRun } from '@/lib/hooks/use-thread-run'
 import {
   updatePendingUserMessage,
   updateSelectedModel,
-  updateSelectedRepoSourceId
-} from '@/lib/stores/chat-actions'
-import { useChatStore } from '@/lib/stores/chat-store'
+  updateSelectedRepoSourceId,
+  useChatStore
+} from '@/lib/stores/chat-store'
+import { updatePendingThread } from '@/lib/stores/page-store'
 import { clearHomeScrollPosition } from '@/lib/stores/scroll-store'
 import { useMutation } from '@/lib/tabby/gql'
 import {
@@ -80,12 +83,12 @@ import {
 } from '@/components/ui/tooltip'
 import { ButtonScrollToBottom } from '@/components/button-scroll-to-bottom'
 import { BANNER_HEIGHT, useShowDemoBanner } from '@/components/demo-banner'
+import { DevPanel } from '@/components/dev-panel'
 import LoadingWrapper from '@/components/loading-wrapper'
 import NotFoundPage from '@/components/not-found-page'
 import TextAreaSearch from '@/components/textarea-search'
 
 import { AssistantMessageSection } from './assistant-message-section'
-import { DevPanel } from './dev-panel'
 import { Header } from './header'
 import { MessagesSkeleton } from './messages-skeleton'
 import { SearchContext } from './search-context'
@@ -127,6 +130,7 @@ export function Search() {
   const [devPanelSize, setDevPanelSize] = useState(45)
   const prevDevPanelSize = useRef(devPanelSize)
   const [enableDeveloperMode] = useEnableDeveloperMode()
+  const [enableSearchPages] = useEnableSearchPages()
   const [threadId, setThreadId] = useState<string | undefined>()
   const threadIdFromURL = useMemo(() => {
     const regex = /^\/search\/(.*)/
@@ -291,26 +295,58 @@ export function Search() {
   const isLoadingRef = useLatest(isLoading)
 
   const { selectedModel, isFetchingModels, models } = useSelectedModel()
-  const { selectedRepository, isFetchingRepositories, repos } =
-    useSelectedRepository()
+  const { isFetchingRepositories, repos } = useSelectedRepository()
   const currentMessageForDev = useMemo(() => {
     return messages.find(item => item.id === messageIdForDev)
   }, [messageIdForDev, messages])
 
   const valueForDev = useMemo(() => {
     if (currentMessageForDev) {
-      return pick(currentMessageForDev?.attachment, 'doc', 'code')
+      return {
+        debugData: currentMessageForDev?.debugData ?? null,
+        ...pick(currentMessageForDev?.attachment, 'doc', 'code')
+      }
     }
     return {
       answers: messages
         .filter(o => o.role === Role.Assistant)
-        .map(o => pick(o, 'doc', 'code'))
+        .map(o => ({
+          debugData: o.debugData ?? null,
+          ...pick(o, 'doc', 'code')
+        }))
     }
   }, [
     messageIdForDev,
     currentMessageForDev?.attachment?.code,
-    currentMessageForDev?.attachment?.doc
+    currentMessageForDev?.attachment?.doc,
+    currentMessageForDev?.debugData
   ])
+
+  const qaPairs = useMemo(() => {
+    const pairs: Array<ConversationPair> = []
+    let currentPair: ConversationPair = { question: null, answer: null }
+    messages.forEach(message => {
+      if (message.role === Role.User) {
+        currentPair.question = message
+      } else if (message.role === Role.Assistant) {
+        if (!currentPair.answer) {
+          // Take the first answer
+          currentPair.answer = message
+          pairs.push(currentPair)
+          currentPair = { question: null, answer: null }
+        }
+      }
+    })
+
+    return pairs
+  }, [messages])
+
+  const codeSourceIdInThread = useMemo(() => {
+    return (
+      qaPairs.find(x => !!x.answer?.codeSourceId)?.answer?.codeSourceId ??
+      undefined
+    )
+  }, [qaPairs])
 
   const onPanelLayout = (sizes: number[]) => {
     if (sizes?.[1]) {
@@ -335,7 +371,6 @@ export function Search() {
       initializing.current = true
 
       if (pendingUserMessage?.content) {
-        // setIsReady(true)
         onSubmitSearch(pendingUserMessage.content, pendingUserMessage.context)
         updatePendingUserMessage(undefined)
         return
@@ -370,7 +405,8 @@ export function Search() {
       threadIdFromURL,
       threadIdFromStreaming: threadId,
       streamingDone: !isLoading,
-      updateThreadURL
+      updateThreadURL,
+      isEphemeral: threadData?.threads.edges[0]?.node?.isEphemeral
     }
   )
 
@@ -429,7 +465,40 @@ export function Search() {
       }
     }
 
+    if (
+      !currentAssistantMessage.attachment?.codeFileList &&
+      answer?.attachmentsFileList?.codeFileList?.length
+    ) {
+      currentAssistantMessage.attachment = {
+        clientCode: null,
+        doc: currentAssistantMessage.attachment?.doc || null,
+        codeFileList: {
+          fileList: answer.attachmentsFileList.codeFileList,
+          truncated: answer.attachmentsFileList.truncated
+        },
+        code: currentAssistantMessage.attachment?.code || null
+      }
+    }
+
     currentAssistantMessage.threadRelevantQuestions = answer?.relevantQuestions
+
+    // update assiatant message status
+    if ('isReadingCode' in answer) {
+      currentAssistantMessage.isReadingCode = answer.isReadingCode
+    }
+    if ('isReadingFileList' in answer) {
+      currentAssistantMessage.isReadingFileList = answer.isReadingFileList
+    }
+    if ('isReadingDocs' in answer) {
+      currentAssistantMessage.isReadingDocs = answer.isReadingDocs
+    }
+
+    // update expose steps
+    currentAssistantMessage.readingCode = answer?.readingCode
+    currentAssistantMessage.readingDoc = answer?.readingDoc
+
+    // debug data
+    currentAssistantMessage.debugData = answer?.debugData
 
     // update message pair ids
     const newUserMessageId = answer.userMessageId
@@ -502,6 +571,9 @@ export function Search() {
   }, [devPanelOpen])
 
   const onSubmitSearch = (question: string, ctx?: ThreadRunContexts) => {
+    const { sourceIdForCodeQuery, sourceIdsForDocQuery, searchPublic } =
+      getSourceInputs(codeSourceIdInThread, enableSearchPages.value, ctx)
+
     const newUserMessageId = tempNanoId()
     const newAssistantMessageId = tempNanoId()
     const newUserMessage: ConversationMessage = {
@@ -512,11 +584,9 @@ export function Search() {
     const newAssistantMessage: ConversationMessage = {
       id: newAssistantMessageId,
       role: Role.Assistant,
-      content: ''
+      content: '',
+      codeSourceId: sourceIdForCodeQuery
     }
-
-    const { sourceIdForCodeQuery, sourceIdsForDocQuery, searchPublic } =
-      getSourceInputs(selectedRepository?.sourceId, ctx)
 
     const codeQuery: InputMaybe<CodeQueryInput> = sourceIdForCodeQuery
       ? { sourceId: sourceIdForCodeQuery, content: question }
@@ -540,7 +610,12 @@ export function Search() {
         generateRelevantQuestions: true,
         codeQuery,
         docQuery,
-        modelName: ctx?.modelName
+        modelName: ctx?.modelName,
+        debugOptions: enableDeveloperMode?.value
+          ? {
+              returnChatCompletionRequest: true
+            }
+          : undefined
       }
     )
   }
@@ -560,6 +635,10 @@ export function Search() {
 
     const newMessages = messages.slice(0, -2)
     const userMessage = messages[userMessageIndex]
+    const assistantMessage = messages[assistantMessageIndex]
+
+    const codeSourceId = assistantMessage?.codeSourceId || codeSourceIdInThread
+
     const newUserMessage: ConversationMessage = {
       ...userMessage,
       id: tempNanoId()
@@ -568,6 +647,7 @@ export function Search() {
       id: tempNanoId(),
       role: Role.Assistant,
       content: '',
+      codeSourceId,
       attachment: {
         code: null,
         doc: null,
@@ -583,7 +663,8 @@ export function Search() {
 
     const { sourceIdForCodeQuery, sourceIdsForDocQuery, searchPublic } =
       getSourceInputs(
-        selectedRepository?.sourceId,
+        codeSourceId,
+        enableSearchPages.value,
         getThreadRunContextsFromMentions(mentions)
       )
 
@@ -612,7 +693,12 @@ export function Search() {
         generateRelevantQuestions: true,
         codeQuery,
         docQuery,
-        modelName: selectedModel
+        modelName: selectedModel,
+        debugOptions: enableDeveloperMode?.value
+          ? {
+              returnChatCompletionRequest: true
+            }
+          : undefined
       }
     })
   }
@@ -685,29 +771,16 @@ export function Search() {
     }
   }, [threadData, fetchingThread, threadError, isReady, threadIdFromURL])
 
-  const [isFetchingMessages] = useDebounceValue(
-    fetchingMessages || threadMessages?.threadMessages?.pageInfo?.hasNextPage,
-    200
-  )
-
-  const qaPairs = useMemo(() => {
-    const pairs: Array<ConversationPair> = []
-    let currentPair: ConversationPair = { question: null, answer: null }
-    messages.forEach(message => {
-      if (message.role === Role.User) {
-        currentPair.question = message
-      } else if (message.role === Role.Assistant) {
-        if (!currentPair.answer) {
-          // Take the first answer
-          currentPair.answer = message
-          pairs.push(currentPair)
-          currentPair = { question: null, answer: null }
-        }
-      }
+  const onConvertToPage = () => {
+    if (!threadId) return
+    const content = messages?.[0].content
+    const title = getTitleFromMessages(sources ?? [], content)
+    updatePendingThread({
+      threadId,
+      title
     })
-
-    return pairs
-  }, [messages])
+    router.push('/pages')
+  }
 
   const style = isShowDemoBanner
     ? { height: `calc(100vh - ${BANNER_HEIGHT})` }
@@ -752,6 +825,9 @@ export function Search() {
             <Header
               threadIdFromURL={threadIdFromURL}
               streamingDone={!isLoading}
+              threadId={threadId}
+              onConvertToPage={onConvertToPage}
+              onShare={onClickShare}
             />
             <LoadingWrapper
               loading={!isReady}
@@ -784,6 +860,7 @@ export function Search() {
                                 key={pair.answer.id}
                                 className="pb-8 pt-2"
                                 message={pair.answer}
+                                userMessage={pair.question}
                                 clientCode={
                                   pair.question?.attachment?.clientCode
                                 }
@@ -791,6 +868,7 @@ export function Search() {
                                 isLastAssistantMessage={isLastMessage}
                                 showRelatedQuestion={isLastMessage}
                                 isDeletable={!isLoading && messages.length > 2}
+                                enableSearchPages={enableSearchPages.value}
                               />
                             )}
                             {!isLastMessage && <Separator />}
@@ -893,7 +971,7 @@ export function Search() {
                         fetchingContextInfo={fetchingContextInfo}
                         modelName={selectedModel}
                         onSelectModel={onSelectModel}
-                        repoSourceId={selectedRepository?.sourceId}
+                        repoSourceId={codeSourceIdInThread}
                         onSelectRepo={onSelectedRepo}
                         isInitializingResources={
                           isFetchingModels || isFetchingRepositories
@@ -981,22 +1059,26 @@ function ThreadMessagesErrorView({
 
 function getSourceInputs(
   repositorySourceId: string | undefined,
+  enableSearchPages: boolean,
   ctx: ThreadRunContexts | undefined
 ) {
-  let sourceIdsForDocQuery: string[] = []
-  let sourceIdForCodeQuery: string | undefined
+  let sourceIdsForDocQuery: string[] = compact([repositorySourceId])
+  let sourceIdForCodeQuery: string | undefined = repositorySourceId
   let searchPublic = false
 
   if (ctx) {
     sourceIdsForDocQuery = uniq(
       // Compatible with existing user messages
       compact(
-        [repositorySourceId, ctx?.codeSourceIds?.[0]].concat(ctx.docSourceIds)
+        [
+          repositorySourceId,
+          ctx?.codeSourceId,
+          enableSearchPages ? 'page' : undefined
+        ].concat(ctx.docSourceIds)
       )
     )
     searchPublic = ctx.searchPublic ?? false
-    sourceIdForCodeQuery =
-      repositorySourceId || ctx.codeSourceIds?.[0] || undefined
+    sourceIdForCodeQuery = repositorySourceId || ctx.codeSourceId || undefined
   }
   return {
     sourceIdsForDocQuery,
@@ -1010,13 +1092,15 @@ interface UseShareThreadOptions {
   threadIdFromStreaming?: string | null
   streamingDone?: boolean
   updateThreadURL?: (threadId: string) => string
+  isEphemeral?: boolean
 }
 
 function useShareThread({
   threadIdFromURL,
   threadIdFromStreaming,
   streamingDone,
-  updateThreadURL
+  updateThreadURL,
+  isEphemeral
 }: UseShareThreadOptions) {
   const { isCopied, copyToClipboard } = useCopyToClipboard({
     timeout: 2000
@@ -1029,7 +1113,7 @@ function useShareThread({
   })
 
   const shouldSetThreadPersisted =
-    !threadIdFromURL &&
+    (!threadIdFromURL || isEphemeral === true) &&
     streamingDone &&
     threadIdFromStreaming &&
     updateThreadURL

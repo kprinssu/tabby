@@ -4,10 +4,13 @@ import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationInfo
 import com.intellij.openapi.application.invokeLater
+import com.intellij.openapi.command.WriteCommandAction
+import com.intellij.openapi.command.WriteCommandAction.runWriteCommandAction
 import com.intellij.openapi.components.serviceOrNull
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.extensions.PluginId
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.ui.Messages
@@ -37,6 +40,7 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
   private val languageSupportService = project.serviceOrNull<LanguageSupportService>()
   private val configurationSync = ConfigurationSync(project)
   private val textDocumentSync = TextDocumentSync(project)
+  private val documentStopUndoMap = mutableMapOf<String, Boolean>()
 
   override fun buildInitializeParams(): InitializeParams {
     val appInfo = ApplicationInfo.getInstance()
@@ -57,7 +61,12 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
       ), capabilities = ClientCapabilities(
         textDocument = TextDocumentClientCapabilities(
           synchronization = SynchronizationCapabilities(),
-          inlineCompletion = InlineCompletionCapabilities(),
+          inlineCompletion = InlineCompletionCapabilities(
+            dynamicRegistration = true,
+          ),
+          codeLens = CodeLensCapabilities(
+            true,
+          ),
         ),
         workspace = WorkspaceClientCapabilities().apply {
           workspaceFolders = true
@@ -132,14 +141,29 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
   }
 
   override fun declaration(params: DeclarationParams): CompletableFuture<List<LocationLink>?> {
-    return CompletableFuture<List<LocationLink>?>().completeAsync {
-      val virtualFile = project.findVirtualFile(params.textDocument.uri) ?: return@completeAsync null
-      val document = project.findDocument(virtualFile) ?: return@completeAsync null
-      val psiFile = project.findPsiFile(virtualFile) ?: return@completeAsync null
-      val languageSupport = languageSupportService ?: return@completeAsync null
-      languageSupport.provideDeclaration(
-        LanguageSupportProvider.FilePosition(psiFile, offsetInDocument(document, params.position))
-      )?.mapNotNull {
+    val future = CompletableFuture<List<LocationLink>?>()
+    val virtualFile = project.findVirtualFile(params.textDocument.uri)
+    val document = virtualFile?.let { project.findDocument(it) }
+    val psiFile = virtualFile?.let { project.findPsiFile(it) }
+    val languageSupport = languageSupportService
+
+    if (virtualFile == null || document == null || psiFile == null || languageSupport == null) {
+      future.complete(null)
+      return future
+    }
+
+    val request = languageSupport.provideDeclaration(
+      LanguageSupportProvider.FilePosition(
+        psiFile,
+        offsetInDocument(document, params.position)
+      )
+    )
+
+    future.whenComplete { _, _ ->
+      request.cancel(true)
+    }
+    request.thenAccept { result ->
+      future.complete(result?.mapNotNull {
         val targetUri = it.file.virtualFile.url
         val targetDocument = project.findDocument(it.file.virtualFile) ?: return@mapNotNull null
         val range = Range(
@@ -147,28 +171,42 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
           positionInDocument(targetDocument, it.range.endOffset)
         )
         LocationLink(targetUri, range, range)
-      }
+      })
     }
+    return future
   }
 
   override fun semanticTokensRange(params: SemanticTokensRangeParams): CompletableFuture<SemanticTokensRangeResult?> {
-    return CompletableFuture<SemanticTokensRangeResult?>().completeAsync {
-      val virtualFile = project.findVirtualFile(params.textDocument.uri) ?: return@completeAsync null
-      val document = project.findDocument(virtualFile) ?: return@completeAsync null
-      val psiFile = project.findPsiFile(virtualFile) ?: return@completeAsync null
-      val languageSupport = languageSupportService ?: return@completeAsync null
-      languageSupport.provideSemanticTokensRange(
-        LanguageSupportProvider.FileRange(
-          psiFile,
-          TextRange(
-            offsetInDocument(document, params.range.start),
-            offsetInDocument(document, params.range.end)
-          )
-        )
-      )?.let {
-        encodeSemanticTokens(document, it)
-      }
+    val future = CompletableFuture<SemanticTokensRangeResult?>()
+    val virtualFile = project.findVirtualFile(params.textDocument.uri)
+    val document = virtualFile?.let { project.findDocument(it) }
+    val psiFile = virtualFile?.let { project.findPsiFile(it) }
+    val languageSupport = languageSupportService
+
+    if (virtualFile == null || document == null || psiFile == null || languageSupport == null) {
+      future.complete(null)
+      return future
     }
+
+    val request = languageSupport.provideSemanticTokensRange(
+      LanguageSupportProvider.FileRange(
+        psiFile,
+        TextRange(
+          offsetInDocument(document, params.range.start),
+          offsetInDocument(document, params.range.end)
+        )
+      )
+    )
+
+    future.whenComplete { _, _ ->
+      request.cancel(true)
+    }
+    request.thenAccept { result ->
+      future.complete(result?.let {
+        encodeSemanticTokens(document, it)
+      })
+    }
+    return future
   }
 
   override fun gitRepository(params: GitRepositoryParams): CompletableFuture<GitRepository?> {
@@ -195,12 +233,18 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
   }
 
   override fun registerCapability(params: RegistrationParams): CompletableFuture<Void> {
-    // nothing to do for now
+    params.registrations.forEach {
+      project.safeSyncPublisher(CapabilityRegistrationListener.TOPIC)
+        ?.onRegisterCapability(it.id, it.method, it.registerOptions)
+    }
     return CompletableFuture<Void>().apply { complete(null) }
   }
 
   override fun unregisterCapability(params: UnregistrationParams): CompletableFuture<Void> {
-    // nothing to do for now
+    params.unregisterations.forEach {
+      project.safeSyncPublisher(CapabilityRegistrationListener.TOPIC)
+        ?.onUnregisterCapability(it.id, it.method)
+    }
     return CompletableFuture<Void>().apply { complete(null) }
   }
 
@@ -213,6 +257,79 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
   override fun workspaceFolders(): CompletableFuture<List<WorkspaceFolder>> {
     return CompletableFuture<List<WorkspaceFolder>>().apply {
       complete(getWorkspaceFolders())
+    }
+  }
+
+  override fun applyEdit(params: ApplyWorkspaceEditParams): CompletableFuture<ApplyWorkspaceEditResponse> {
+    val future = CompletableFuture<ApplyWorkspaceEditResponse>()
+    invokeLater {
+      try {
+        val edit = params.edit
+        runWriteCommandAction(project) {
+          edit.changes?.forEach { (uri, edits) ->
+            val virtualFile = project.findVirtualFile(uri) ?: return@forEach
+            val document = project.findDocument(virtualFile) ?: return@forEach
+            edits.forEach { textEdit ->
+              val startOffset = offsetInDocument(document, textEdit.range.start).coerceIn(0, document.textLength)
+              val endOffset = offsetInDocument(document, textEdit.range.end).coerceIn(0, document.textLength)
+              document.replaceString(startOffset, endOffset, textEdit.newText)
+            }
+          }
+        }
+        future.complete(ApplyWorkspaceEditResponse(true))
+      } catch (e: Exception) {
+        logger.warn("Failed to apply workspace edit", e)
+        future.complete(ApplyWorkspaceEditResponse(false).apply { failureReason = "Failed to apply workspace edit ${e.message}" })
+      }
+    }
+    return future
+  }
+
+  override fun applyWorkspaceEdit(params: TabbyApplyWorkspaceEditParams): CompletableFuture<Boolean> {
+    val future = CompletableFuture<Boolean>()
+    invokeLater {
+      try {
+        val edit = params.edit
+        edit.changes?.forEach { (uri, edits) ->
+          val virtualFile = project.findVirtualFile(uri) ?: return@forEach
+          val document = project.findDocument(virtualFile) ?: return@forEach
+          val url = FileDocumentManager.getInstance()
+            .getFile(document)?.url ?: return@forEach
+
+          logger.info("url $url")
+          if (params.options?.undoStopBefore == true) {
+              documentStopUndoMap[url] = true
+          }
+
+          if (documentStopUndoMap[url] == true) {
+            // continued command action with same group id will be combined into one undo history
+            WriteCommandAction.writeCommandAction(project).withGroupId("tabby").run<Throwable> {
+              writeDocument(document, edits)
+            }
+          } else {
+            runWriteCommandAction(project) {
+              writeDocument(document, edits)
+            }
+          }
+
+          if (params.options?.undoStopAfter == true) {
+            documentStopUndoMap[url] = false
+          }
+        }
+        future.complete(true)
+      } catch (e: Exception) {
+        logger.warn("Failed to apply workspace edit", e)
+        future.complete(false)
+      }
+    }
+    return future
+  }
+
+  private fun writeDocument(document: Document, edits: List<TextEdit>) {
+    edits.forEach { textEdit ->
+      val startOffset = offsetInDocument(document, textEdit.range.start).coerceIn(0, document.textLength)
+      val endOffset = offsetInDocument(document, textEdit.range.end).coerceIn(0, document.textLength)
+      document.replaceString(startOffset, endOffset, textEdit.newText)
     }
   }
 
@@ -253,6 +370,7 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
   override fun dispose() {
     configurationSync.dispose()
     textDocumentSync.dispose()
+    documentStopUndoMap.clear()
   }
 
   private fun getWorkspaceFolders(): List<WorkspaceFolder> {
@@ -328,6 +446,16 @@ class LanguageClient(private val project: Project) : com.tabbyml.intellijtabby.l
     companion object {
       @Topic.ProjectLevel
       val TOPIC = Topic(StatusListener::class.java, Topic.BroadcastDirection.NONE)
+    }
+  }
+
+  interface CapabilityRegistrationListener {
+    fun onRegisterCapability(id: String, method: String, options: Any) {}
+    fun onUnregisterCapability(id: String, method: String) {}
+
+    companion object {
+      @Topic.ProjectLevel
+      val TOPIC = Topic(CapabilityRegistrationListener::class.java, Topic.BroadcastDirection.NONE)
     }
   }
 }

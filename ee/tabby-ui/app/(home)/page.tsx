@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
 import tabbyUrl from '@/assets/logo-dark.png'
+import { compact } from 'lodash-es'
 import { useQuery } from 'urql'
 import { useStore } from 'zustand'
 
@@ -14,12 +15,11 @@ import {
   useIsChatEnabled,
   useIsFetchingServerInfo
 } from '@/lib/hooks/use-server-info'
-import { setThreadsPageNo } from '@/lib/stores/answer-engine-store'
 import {
   updatePendingUserMessage,
   updateSelectedModel,
   updateSelectedRepoSourceId
-} from '@/lib/stores/chat-actions'
+} from '@/lib/stores/chat-store'
 import {
   clearHomeScrollPosition,
   setHomeScrollPosition,
@@ -39,6 +39,7 @@ import { MyAvatar } from '@/components/user-avatar'
 import UserPanel from '@/components/user-panel'
 
 import { AnimationWrapper } from './components/animation-wrapper'
+import { RelatedQuestions } from './components/related-questions'
 import Stats from './components/stats'
 import { ThreadFeeds } from './components/thread-feeds'
 
@@ -60,7 +61,8 @@ function MainPanel() {
   const scrollY = useStore(useScrollStore, state => state.homePage)
 
   const { selectedModel, isFetchingModels, models } = useSelectedModel()
-  const { selectedRepository, isFetchingRepositories } = useSelectedRepository()
+  const { selectedRepository, isFetchingRepositories, onSelectRepository } =
+    useSelectedRepository()
 
   const showMainSection = !!data?.me || !isFetchingServerInfo
 
@@ -90,15 +92,31 @@ function MainPanel() {
     updateSelectedModel(model)
   }
 
-  const onSelectedRepo = (sourceId: string | undefined) => {
-    updateSelectedRepoSourceId(sourceId)
-  }
-
   const onSearch = (question: string, context?: ThreadRunContexts) => {
     setIsLoading(true)
     updatePendingUserMessage({
       content: question,
-      context
+      context: {
+        ...context,
+        codeSourceId: selectedRepository?.id,
+        docSourceIds: compact([
+          selectedRepository?.id,
+          ...(context?.docSourceIds ?? [])
+        ])
+      }
+    })
+    router.push('/search')
+  }
+
+  const onClickRelatedQuestion = (question: string, sourceId: string) => {
+    updateSelectedRepoSourceId(sourceId)
+    updatePendingUserMessage({
+      content: question,
+      context: {
+        docSourceIds: [sourceId],
+        codeSourceId: sourceId,
+        modelName: selectedModel
+      }
     })
     router.push('/search')
   }
@@ -115,11 +133,11 @@ function MainPanel() {
           top: isShowDemoBanner ? BANNER_HEIGHT : 0
         }}
       >
-        <div className="flex items-center gap-x-6">
+        <div className="flex items-center gap-x-2">
           <ClientOnly>
             <ThemeToggle />
           </ClientOnly>
-          <NotificationBox />
+          <NotificationBox className="mr-4" />
           <UserPanel showHome={false} showSetting>
             <MyAvatar className="h-10 w-10 border" />
           </UserPanel>
@@ -167,21 +185,24 @@ function MainPanel() {
                   modelName={selectedModel}
                   onSelectModel={handleSelectModel}
                   repoSourceId={selectedRepository?.sourceId}
-                  onSelectRepo={onSelectedRepo}
+                  onSelectRepo={onSelectRepository}
                   isInitializingResources={
                     isFetchingModels || isFetchingRepositories
                   }
                   models={models}
                 />
+                <RelatedQuestions
+                  sourceId={selectedRepository?.sourceId}
+                  onClickQuestion={onClickRelatedQuestion}
+                />
               </AnimationWrapper>
             )}
             <Stats />
             <ThreadFeeds
-              className="lg:mt-8"
-              onNavigateToThread={({ pageNo }) => {
+              className="lg:mt-6"
+              onNavigateToThread={() => {
                 if (!scroller.current) return
                 setHomeScrollPosition(scroller.current.scrollTop)
-                setThreadsPageNo(pageNo)
               }}
             />
           </div>

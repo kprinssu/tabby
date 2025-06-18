@@ -1,3 +1,4 @@
+import EventEmitter from "events";
 import {
   commands,
   env,
@@ -14,32 +15,39 @@ import {
   ProgressLocation,
   Location,
   LocationLink,
-  TabInputText,
+  SymbolInformation,
+  DocumentSymbol,
 } from "vscode";
-import { TABBY_CHAT_PANEL_API_VERSION } from "tabby-chat-panel";
 import type {
-  ServerApi,
-  ChatCommand,
+  ServerApiList,
+  ChatView,
   EditorContext,
-  OnLoadedParams,
   LookupSymbolHint,
   SymbolInfo,
   FileLocation,
   GitRepository,
-  EditorFileContext,
   ListFilesInWorkspaceParams,
   ListFileItem,
   FileRange,
+  Filepath,
+  ListSymbolsParams,
+  ListSymbolItem,
+  ChangeItem,
+  GetChangesParams,
+  EditorFileContext,
+  TerminalContext,
+  ChatCommand,
 } from "tabby-chat-panel";
 import * as semver from "semver";
+import debounce from "debounce";
 import { v4 as uuid } from "uuid";
 import type { StatusInfo, Config } from "tabby-agent";
-import type { GitProvider } from "../git/GitProvider";
-import type { Client as LspClient } from "../lsp/Client";
+import type { GitProvider, Repository } from "../git/GitProvider";
+import type { Client as LspClient } from "../lsp/client";
 import { createClient } from "./createClient";
 import { isBrowser } from "../env";
 import { getLogger } from "../logger";
-import { getFileContextFromSelection } from "./fileContext";
+import { getEditorContext } from "./context";
 import {
   localUriToChatPanelFilepath,
   chatPanelFilepathToLocalUri,
@@ -47,29 +55,20 @@ import {
   vscodeRangeToChatPanelPositionRange,
   chatPanelLocationToVSCodeRange,
   isValidForSyncActiveEditorSelection,
-  uriToListFileItem,
-  escapeGlobPattern,
+  vscodeRangeToChatPanelLineRange,
+  isCompatible,
 } from "./utils";
+import { listFiles } from "../findFiles";
+import { wrapCancelableFunction } from "../cancelableFunction";
 import mainHtml from "./html/main.html";
 import errorHtml from "./html/error.html";
+import { getTerminalContext } from "../terminal";
 
-export class ChatWebview {
+export class ChatWebview extends EventEmitter {
   private readonly logger = getLogger("ChatWebView");
   private disposables: Disposable[] = [];
   private webview: Webview | undefined = undefined;
-  private client: ServerApi | undefined = undefined;
-
-  // Once the chat iframe is loaded, the `onLoaded` should be called from server side later,
-  // and we can start to initialize the chat panel.
-  // So we set a timeout here to ensure the `onLoaded` is called, otherwise we will show an error.
-  private onLoadedTimeout: NodeJS.Timeout | undefined = undefined;
-
-  // Mark the `onLoaded` is called. Before this, we should schedule the actions like
-  // `addRelevantContext` and `executeCommand` as pending actions.
-  private chatPanelLoaded = false;
-
-  // Pending actions to perform after the chat panel is initialized.
-  private pendingActions: (() => Promise<void>)[] = [];
+  private client: ServerApiList | undefined = undefined;
 
   // The current server config used to load the chat panel.
   private currentConfig: Config["server"] | undefined = undefined;
@@ -77,17 +76,28 @@ export class ChatWebview {
   // A number to ensure the html is reloaded when assigned a new value
   private reloadCount = 0;
 
+  // Once the chat iframe is loaded, the `createChatPanelApiClient` should be resolved,
+  // and we can start to `initChatPanel`.
+  // So we set a timeout here to ensure the `createChatPanelApiClient` is resolved,
+  // otherwise we will show an error.
+  private createClientTimeout: NodeJS.Timeout | undefined = undefined;
+
+  // Pending actions to perform after the chat panel is initialized.
+  private pendingActions: (() => Promise<void>)[] = [];
+
   // A callback list for invoke javascript function by postMessage
   private pendingCallbacks = new Map<string, (...arg: unknown[]) => void>();
 
   // Store the chat state to be reload when webview is reloaded
-  private sessionState: Record<string, unknown> = {};
+  private sessionStateMap = new Map<string, Record<string, unknown>>();
 
   constructor(
     private readonly context: ExtensionContext,
     private readonly lspClient: LspClient,
     private readonly gitProvider: GitProvider,
-  ) {}
+  ) {
+    super();
+  }
 
   async init(webview: Webview) {
     webview.options = {
@@ -95,8 +105,6 @@ export class ChatWebview {
       enableCommandUris: true,
     };
     this.webview = webview;
-
-    this.client = this.createChatPanelApiClient();
 
     const statusListener = () => {
       this.checkStatusAndLoadContent();
@@ -111,15 +119,15 @@ export class ChatWebview {
 
     this.disposables.push(
       window.onDidChangeActiveTextEditor((editor) => {
-        if (this.chatPanelLoaded) {
-          this.notifyActiveEditorSelectionChange(editor);
+        if (this.client) {
+          this.debouncedNotifyActiveEditorSelectionChange(editor);
         }
       }),
     );
     this.disposables.push(
       window.onDidChangeTextEditorSelection((event) => {
-        if (event.textEditor === window.activeTextEditor && this.chatPanelLoaded) {
-          this.notifyActiveEditorSelectionChange(event.textEditor);
+        if (event.textEditor === window.activeTextEditor && this.client) {
+          this.debouncedNotifyActiveEditorSelectionChange(event.textEditor);
         }
       }),
     );
@@ -128,7 +136,7 @@ export class ChatWebview {
       webview.onDidReceiveMessage((event) => {
         switch (event.action) {
           case "chatIframeLoaded": {
-            this.onLoadedTimeout = setTimeout(() => {
+            this.createClientTimeout = setTimeout(() => {
               const endpoint = this.currentConfig?.endpoint ?? "";
               if (!endpoint) {
                 this.checkStatusAndLoadContent();
@@ -142,7 +150,7 @@ export class ChatWebview {
             return;
           }
           case "syncStyle": {
-            this.client?.updateTheme(event.style, this.getColorThemeString());
+            this.client?.["0.8.0"].updateTheme(event.style, this.getColorThemeString());
             return;
           }
           case "jsCallback": {
@@ -160,11 +168,10 @@ export class ChatWebview {
     this.disposables = [];
     this.webview = undefined;
     this.client = undefined;
-    if (this.onLoadedTimeout) {
-      clearTimeout(this.onLoadedTimeout);
-      this.onLoadedTimeout = undefined;
+    if (this.createClientTimeout) {
+      clearTimeout(this.createClientTimeout);
+      this.createClientTimeout = undefined;
     }
-    this.chatPanelLoaded = false;
     this.currentConfig = undefined;
   }
 
@@ -182,36 +189,107 @@ export class ChatWebview {
     });
   }
 
+  getApiVersions(): string[] | undefined {
+    return Object.keys(this.client ?? {}).filter((key) => semver.valid(key));
+  }
+
+  get isTerminalContextEnabled(): boolean {
+    return this.getApiVersions()?.some((version) => isCompatible(version, "0.10.0")) ?? false;
+  }
+
+  setActiveSelection(selection: EditorContext) {
+    if (this.client) {
+      this.logger.info(`Set active selection: ${selection}`);
+      this.client["0.8.0"].updateActiveSelection(selection);
+    } else {
+      this.pendingActions.push(async () => {
+        this.logger.info(`Set pending active selection: ${selection}`);
+        await this.client?.["0.8.0"].updateActiveSelection(selection);
+      });
+    }
+  }
+
   async addRelevantContext(context: EditorContext) {
-    if (this.client && this.chatPanelLoaded) {
+    if (this.client) {
       this.logger.info(`Adding relevant context: ${context}`);
-      this.client.addRelevantContext(context);
+      if (context.kind === "terminal") {
+        this.client["0.10.0"]?.addRelevantContext(context);
+      } else {
+        this.client["0.8.0"].addRelevantContext(context);
+      }
     } else {
       this.pendingActions.push(async () => {
         this.logger.info(`Adding pending relevant context: ${context}`);
-        await this.client?.addRelevantContext(context);
+        if (context.kind === "terminal") {
+          await this.client?.["0.10.0"]?.addRelevantContext(context);
+        } else {
+          await this.client?.["0.8.0"].addRelevantContext(context);
+        }
       });
     }
   }
 
   async executeCommand(command: ChatCommand) {
-    if (this.client && this.chatPanelLoaded) {
+    if (this.client) {
       this.logger.info(`Executing command: ${command}`);
-      this.client.executeCommand(command);
+      if (command === "explain-terminal") {
+        this.client["0.10.0"]?.executeCommand(command);
+      } else {
+        this.client["0.8.0"].executeCommand(command);
+      }
     } else {
       this.pendingActions.push(async () => {
         this.logger.info(`Executing pending command: ${command}`);
-        await this.client?.executeCommand(command);
+        if (command === "explain-terminal") {
+          await this.client?.["0.10.0"]?.executeCommand(command);
+        } else {
+          await this.client?.["0.8.0"].executeCommand(command);
+        }
       });
     }
   }
 
-  private createChatPanelApiClient(): ServerApi | undefined {
-    const webview = this.webview;
-    if (!webview) {
-      return undefined;
+  async navigate(view: ChatView) {
+    if (this.client) {
+      this.logger.info(`Navigate: ${view}`);
+      this.client["0.8.0"].navigate(view);
     }
-    return createClient(webview, {
+  }
+
+  private async initChatPanel(webview: Webview) {
+    const client = await this.createChatPanelApiClient(webview);
+    this.client = client;
+    this.emit("didChangedStatus", "ready");
+
+    if (this.createClientTimeout) {
+      clearTimeout(this.createClientTimeout);
+      this.createClientTimeout = undefined;
+    }
+
+    // 1. Send pending actions
+    // 2. Call the client's init method
+    // 3. Show the chat panel (call syncStyle underlay)
+    this.pendingActions.forEach(async (fn) => {
+      await fn();
+    });
+    this.pendingActions = [];
+
+    const isMac = isBrowser
+      ? navigator.userAgent.toLowerCase().includes("mac")
+      : process.platform.toLowerCase().includes("darwin");
+
+    await client["0.8.0"].init({
+      fetcherOptions: {
+        authorization: this.currentConfig?.token ?? "",
+      },
+      useMacOSKeyboardEventHandler: isMac,
+    });
+
+    webview.postMessage({ action: "showChatPanel" });
+  }
+
+  private async createChatPanelApiClient(webview: Webview): Promise<ServerApiList> {
+    return await createClient(webview, {
       refresh: async () => {
         commands.executeCommand("tabby.reconnectToServer");
         return;
@@ -226,16 +304,16 @@ export class ChatWebview {
         await this.applyInEditor(editor, content);
       },
 
-      onApplyInEditorV2: async (content: string, opts?: { languageId: string; smart: boolean }) => {
+      onApplyInEditorV2: async (content: string, options?: { languageId?: string; smart?: boolean }) => {
         const editor = window.activeTextEditor;
         if (!editor) {
           window.showErrorMessage("No active editor found.");
           return;
         }
-        if (!opts || !opts.smart) {
+        if (!options || !options.smart) {
           await this.applyInEditor(editor, content);
-        } else if (editor.document.languageId !== opts.languageId) {
-          this.logger.debug("Editor's languageId:", editor.document.languageId, "opts.languageId:", opts.languageId);
+        } else if (editor.document.languageId !== options.languageId) {
+          this.logger.debug("Editor's languageId:", editor.document.languageId, "opts.languageId:", options.languageId);
           await this.applyInEditor(editor, content);
           window.showInformationMessage("The active editor is not in the correct language. Did normal apply.");
         } else {
@@ -243,57 +321,19 @@ export class ChatWebview {
         }
       },
 
-      onLoaded: async (params: OnLoadedParams | undefined) => {
-        if (this.onLoadedTimeout) {
-          clearTimeout(this.onLoadedTimeout);
-          this.onLoadedTimeout = undefined;
-        }
-
-        if (params?.apiVersion) {
-          const error = this.checkChatPanelApiVersion(params.apiVersion);
-          if (error) {
-            this.loadErrorPage(error);
-            return;
-          }
-        }
-
-        this.chatPanelLoaded = true;
-
-        // 1. Send pending actions
-        // 2. Call the client's init method
-        // 3. Show the chat panel (call syncStyle underlay)
-        this.pendingActions.forEach(async (fn) => {
-          await fn();
-        });
-        this.pendingActions = [];
-
-        const isMac = isBrowser
-          ? navigator.userAgent.toLowerCase().includes("mac")
-          : process.platform.toLowerCase().includes("darwin");
-
-        await this.client?.init({
-          fetcherOptions: {
-            authorization: this.currentConfig?.token ?? "",
-          },
-          useMacOSKeyboardEventHandler: isMac,
-        });
-
-        this.webview?.postMessage({ action: "showChatPanel" });
-      },
-
-      onCopy: (content) => {
+      onCopy: async (content) => {
         env.clipboard.writeText(content);
       },
 
-      onKeyboardEvent: (type: string, event: KeyboardEventInit) => {
+      onKeyboardEvent: async (type: string, event: KeyboardEventInit) => {
         this.logger.debug(`Dispatching keyboard event: ${type} ${JSON.stringify(event)}`);
         this.webview?.postMessage({ action: "dispatchKeyboardEvent", type, event });
       },
 
-      lookupSymbol: async (symbol: string, hints?: LookupSymbolHint[] | undefined): Promise<SymbolInfo | undefined> => {
+      lookupSymbol: async (symbol: string, hints?: LookupSymbolHint[] | undefined): Promise<SymbolInfo | null> => {
         if (!symbol.match(/^[a-zA-Z_][a-zA-Z0-9_]*$/)) {
           // Do not process invalid symbols
-          return undefined;
+          return null;
         }
         /// FIXME: When no hints provided, try to use `vscode.executeWorkspaceSymbolProvider` to find the symbol.
 
@@ -398,7 +438,7 @@ export class ChatWebview {
           }
         }
         this.logger.debug(`Symbol not found: ${symbol} with hints: ${JSON.stringify(hints)}`);
-        return undefined;
+        return null;
       },
 
       openInEditor: async (fileLocation: FileLocation): Promise<boolean> => {
@@ -474,65 +514,55 @@ export class ChatWebview {
           return null;
         }
 
-        const fileContext = await getFileContextFromSelection(editor, this.gitProvider);
-        return fileContext;
+        return await getEditorContext(editor, this.gitProvider);
+      },
+
+      getActiveTerminalSelection: async (): Promise<TerminalContext | null> => {
+        const terminalContext = await getTerminalContext();
+        if (!terminalContext) {
+          this.logger.warn("No active terminal selection found.");
+          return null;
+        }
+        return terminalContext;
       },
 
       fetchSessionState: async (keys?: string[] | undefined): Promise<Record<string, unknown> | null> => {
+        const sessionStateKey = this.currentConfig?.endpoint ?? "";
+        const sessionState = this.sessionStateMap.get(sessionStateKey) ?? {};
+
         if (!keys) {
-          return { ...this.sessionState };
+          return { ...sessionState };
         }
 
         const filtered: Record<string, unknown> = {};
         for (const key of keys) {
-          if (key in this.sessionState) {
-            filtered[key] = this.sessionState[key];
+          if (key in sessionState) {
+            filtered[key] = sessionState[key];
           }
         }
         return filtered;
       },
 
       storeSessionState: async (state: Record<string, unknown>) => {
-        this.sessionState = {
-          ...this.sessionState,
+        const sessionStateKey = this.currentConfig?.endpoint ?? "";
+        const sessionState = this.sessionStateMap.get(sessionStateKey) ?? {};
+        this.sessionStateMap.set(sessionStateKey, {
+          ...sessionState,
           ...state,
-        };
+        });
       },
 
       listFileInWorkspace: async (params: ListFilesInWorkspaceParams): Promise<ListFileItem[]> => {
-        const maxResults = params.limit || 50;
-        const searchQuery = params.query?.trim();
-
-        if (!searchQuery) {
-          const openTabs = window.tabGroups.all
-            .flatMap((group) => group.tabs)
-            .filter((tab) => tab.input && (tab.input as TabInputText).uri);
-
-          this.logger.info(`No query provided, listing ${openTabs.length} opened editors.`);
-          return openTabs.map((tab) => uriToListFileItem((tab.input as TabInputText).uri, this.gitProvider));
-        }
-
         try {
-          const caseInsensitivePattern = searchQuery
-            .split("")
-            .map((char) => {
-              if (char.toLowerCase() !== char.toUpperCase()) {
-                return `{${char.toLowerCase()},${char.toUpperCase()}}`;
-              }
-              return escapeGlobPattern(char);
-            })
-            .join("");
-
-          const globPattern = `**/${caseInsensitivePattern}*`;
-
-          this.logger.info(`Searching files with pattern: ${globPattern}, limit: ${maxResults}`);
-
-          const files = await workspace.findFiles(globPattern, undefined, maxResults);
-          this.logger.info(`Found ${files.length} files.`);
-          return files.map((uri) => uriToListFileItem(uri, this.gitProvider));
+          const files = await this.listFiles(params.query, params.limit);
+          return files.map((item) => {
+            return {
+              filepath: localUriToChatPanelFilepath(item.uri, this.gitProvider),
+              source: item.isOpenedInEditor ? "openedInEditor" : "searchResult",
+            };
+          });
         } catch (error) {
-          this.logger.warn("Failed to find files:", error);
-          window.showErrorMessage("Failed to find files.");
+          this.logger.warn("Failed to list files:", error);
           return [];
         }
       },
@@ -545,6 +575,253 @@ export class ChatWebview {
         }
         const document = await workspace.openTextDocument(uri);
         return document.getText(chatPanelLocationToVSCodeRange(info.range) ?? undefined);
+      },
+      listSymbols: async (params: ListSymbolsParams): Promise<ListSymbolItem[]> => {
+        const { query } = params;
+        let { limit } = params;
+        const editor = window.activeTextEditor;
+
+        if (!editor) {
+          this.logger.warn("listActiveSymbols: No active editor found.");
+          return [];
+        }
+        if (!limit || limit < 0) {
+          limit = 20;
+        }
+
+        const getDocumentSymbols = async (editor: TextEditor): Promise<SymbolInformation[]> => {
+          this.logger.debug(`getDocumentSymbols: Fetching document symbols for ${editor.document.uri.toString()}`);
+          const symbols =
+            (await commands.executeCommand<DocumentSymbol[] | SymbolInformation[]>(
+              "vscode.executeDocumentSymbolProvider",
+              editor.document.uri,
+            )) || [];
+
+          const result: SymbolInformation[] = [];
+          const queue: (DocumentSymbol | SymbolInformation)[] = [...symbols];
+
+          // BFS to get all symbols up to the limit
+          while (queue.length > 0 && result.length < limit) {
+            const current = queue.shift();
+            if (!current) {
+              continue;
+            }
+
+            if (current instanceof DocumentSymbol) {
+              const converted = new SymbolInformation(
+                current.name,
+                current.kind,
+                current.detail,
+                new Location(editor.document.uri, current.range),
+              );
+
+              result.push(converted);
+
+              if (result.length >= limit) {
+                break;
+              }
+
+              queue.push(...current.children);
+            } else {
+              result.push(current);
+
+              if (result.length >= limit) {
+                break;
+              }
+            }
+          }
+
+          this.logger.debug(`getDocumentSymbols: Found ${result.length} symbols.`);
+          return result;
+        };
+
+        const getWorkspaceSymbols = async (query: string): Promise<ListSymbolItem[]> => {
+          this.logger.debug(`getWorkspaceSymbols: Fetching workspace symbols for query "${query}"`);
+          try {
+            const symbols =
+              (await commands.executeCommand<SymbolInformation[]>("vscode.executeWorkspaceSymbolProvider", query)) ||
+              [];
+
+            const items = symbols.map((symbol) => ({
+              filepath: localUriToChatPanelFilepath(symbol.location.uri, this.gitProvider),
+              range: vscodeRangeToChatPanelLineRange(symbol.location.range),
+              label: symbol.name,
+            }));
+            this.logger.debug(`getWorkspaceSymbols: Found ${items.length} symbols.`);
+            return items;
+          } catch (error) {
+            this.logger.error(`Workspace symbols failed: ${error}`);
+            return [];
+          }
+        };
+
+        const filterSymbols = (symbols: SymbolInformation[], query: string): SymbolInformation[] => {
+          const lowerQuery = query.toLowerCase();
+          const filtered = symbols.filter(
+            (s) => s.name.toLowerCase().includes(lowerQuery) || s.containerName?.toLowerCase().includes(lowerQuery),
+          );
+          this.logger.debug(`filterSymbols: Filtered down to ${filtered.length} symbols with query "${query}"`);
+          return filtered;
+        };
+
+        const mergeResults = (
+          local: ListSymbolItem[],
+          workspace: ListSymbolItem[],
+          query: string,
+          limit = 20,
+        ): ListSymbolItem[] => {
+          this.logger.debug(
+            `mergeResults: Merging ${local.length} local symbols and ${workspace.length} workspace symbols with query "${query}" and limit ${limit}`,
+          );
+
+          const seen = new Set<string>();
+          const allItems = [...local, ...workspace];
+          const uniqueItems: ListSymbolItem[] = [];
+
+          for (const item of allItems) {
+            const key = `${item.filepath}-${item.label}-${item.range.start}-${item.range.end}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              uniqueItems.push(item);
+            }
+          }
+
+          // Sort all items by the match score
+          const getMatchScore = (label: string): number => {
+            const lowerLabel = label.toLowerCase();
+            const lowerQuery = query.toLowerCase();
+
+            if (lowerLabel === lowerQuery) return 3;
+            if (lowerLabel.startsWith(lowerQuery)) return 2;
+            if (lowerLabel.includes(lowerQuery)) return 1;
+            return 0;
+          };
+
+          uniqueItems.sort((a, b) => {
+            const scoreA = getMatchScore(a.label);
+            const scoreB = getMatchScore(b.label);
+
+            if (scoreB !== scoreA) return scoreB - scoreA;
+            return a.label.length - b.label.length;
+          });
+
+          this.logger.debug(`mergeResults: Returning ${Math.min(uniqueItems.length, limit)} sorted symbols.`);
+          return uniqueItems.slice(0, limit);
+        };
+
+        const symbolToItem = (symbol: SymbolInformation, filepath: Filepath): ListSymbolItem => {
+          return {
+            filepath,
+            range: vscodeRangeToChatPanelLineRange(symbol.location.range),
+            label: symbol.name,
+          };
+        };
+
+        try {
+          this.logger.info("listActiveSymbols: Starting to fetch symbols.");
+          const defaultSymbols = await getDocumentSymbols(editor);
+          const filepath = localUriToChatPanelFilepath(editor.document.uri, this.gitProvider);
+
+          if (!query) {
+            const items = defaultSymbols.slice(0, limit).map((symbol) => symbolToItem(symbol, filepath));
+            this.logger.debug(`listActiveSymbols: Returning ${items.length} symbols.`);
+            return items;
+          }
+
+          const [filteredDefault, workspaceSymbols] = await Promise.all([
+            Promise.resolve(filterSymbols(defaultSymbols, query)),
+            getWorkspaceSymbols(query),
+          ]);
+          this.logger.info(
+            `listActiveSymbols: Found ${filteredDefault.length} filtered local symbols and ${workspaceSymbols.length} workspace symbols.`,
+          );
+
+          const mergedItems = mergeResults(
+            filteredDefault.map((s) => symbolToItem(s, filepath)),
+            workspaceSymbols,
+            query,
+            limit,
+          );
+          this.logger.info(`listActiveSymbols: Returning ${mergedItems.length} merged symbols.`);
+          return mergedItems;
+        } catch (error) {
+          this.logger.error(`listActiveSymbols: Failed - ${error}`);
+          return [];
+        }
+      },
+
+      getChanges: async (params: GetChangesParams): Promise<ChangeItem[]> => {
+        if (!this.gitProvider.isApiAvailable()) {
+          return [];
+        }
+
+        const maxChars = params.maxChars ?? undefined;
+        let remainingChars = maxChars;
+
+        const repositories = this.gitProvider.getRepositories();
+        if (!repositories) {
+          return [];
+        }
+
+        const getRepoChanges = async (
+          repos: Repository[],
+          staged: boolean,
+          charLimit?: number,
+        ): Promise<ChangeItem[]> => {
+          if (charLimit !== undefined && charLimit <= 0) {
+            return [];
+          }
+
+          const res: ChangeItem[] = [];
+          let currentCharCount = 0;
+
+          for (const repo of repos) {
+            const diffs = await this.gitProvider.getDiff(repo, staged);
+            if (!diffs) {
+              continue;
+            }
+
+            for (const diff of diffs) {
+              const diffChars = diff.length;
+
+              if (charLimit !== undefined && currentCharCount + diffChars > charLimit) {
+                break;
+              }
+
+              res.push({
+                content: diff,
+                staged: staged,
+              } as ChangeItem);
+
+              currentCharCount += diffChars;
+            }
+
+            if (charLimit !== undefined && currentCharCount >= charLimit) {
+              break;
+            }
+          }
+
+          return res;
+        };
+
+        const stagedChanges: ChangeItem[] = await getRepoChanges(repositories, true, remainingChars);
+
+        const stagedCharCount = stagedChanges.reduce((count, item) => count + item.content.length, 0);
+
+        remainingChars = maxChars !== undefined ? maxChars - stagedCharCount : undefined;
+
+        const unstagedChanges: ChangeItem[] = await getRepoChanges(repositories, false, remainingChars);
+
+        const res = [...stagedChanges, ...unstagedChanges];
+
+        this.logger.info(`Found ${res.length} changed files.`);
+
+        return res;
+      },
+      runShell: async (command: string) => {
+        const terminal = window.createTerminal("Tabby");
+        terminal.show();
+        terminal.sendText(command);
       },
     });
   }
@@ -584,13 +861,16 @@ export class ChatWebview {
     if (!webview) {
       return;
     }
-    this.chatPanelLoaded = false;
+    this.client = undefined;
+    this.emit("didChangedStatus", "loading");
     this.reloadCount += 1;
     webview.html = mainHtml
       .replace(/{{RELOAD_COUNT}}/g, this.reloadCount.toString())
       .replace(/{{SERVER_ENDPOINT}}/g, this.currentConfig?.endpoint ?? "")
       .replace(/{{URI_STYLESHEET}}/g, this.getUriStylesheet())
       .replace(/{{URI_AVATAR_TABBY}}/g, this.getUriAvatarTabby());
+
+    this.initChatPanel(webview);
   }
 
   private loadErrorPage(message: string) {
@@ -598,7 +878,8 @@ export class ChatWebview {
     if (!webview) {
       return;
     }
-    this.chatPanelLoaded = false;
+    this.client = undefined;
+    this.emit("didChangedStatus", "error");
     this.reloadCount += 1;
     webview.html = errorHtml
       .replace(/{{RELOAD_COUNT}}/g, this.reloadCount.toString())
@@ -630,7 +911,7 @@ export class ChatWebview {
       return "You need to launch the server with the chat model enabled; for example, use `--chat-model Qwen2-1.5B-Instruct`.";
     }
 
-    const MIN_VERSION = "0.18.0";
+    const MIN_VERSION = "0.27.0";
 
     if (health["version"]) {
       let version: semver.SemVer | undefined | null = undefined;
@@ -648,25 +929,6 @@ export class ChatWebview {
       }
     }
 
-    return undefined;
-  }
-
-  private checkChatPanelApiVersion(version: string): string | undefined {
-    const serverApiVersion = semver.coerce(version);
-    if (serverApiVersion) {
-      this.logger.info(
-        `Chat panel server API version: ${serverApiVersion}, client API version: ${TABBY_CHAT_PANEL_API_VERSION}`,
-      );
-      const clientApiMajorVersion = semver.major(TABBY_CHAT_PANEL_API_VERSION);
-      const clientApiMinorVersion = semver.minor(TABBY_CHAT_PANEL_API_VERSION);
-      const clientCompatibleRange = `~${clientApiMajorVersion}.${clientApiMinorVersion}`;
-      if (semver.ltr(serverApiVersion, clientCompatibleRange)) {
-        return "Please update your Tabby server to the latest version to use chat panel.";
-      }
-      if (semver.gtr(serverApiVersion, clientCompatibleRange)) {
-        return "Please update the Tabby VSCode extension to the latest version to use chat panel.";
-      }
-    }
     return undefined;
   }
 
@@ -734,14 +996,32 @@ export class ChatWebview {
   }
 
   private async notifyActiveEditorSelectionChange(editor: TextEditor | undefined) {
-    if (!editor || !isValidForSyncActiveEditorSelection(editor)) {
-      await this.client?.updateActiveSelection(null);
+    if (editor && editor.document.uri.scheme === "output") {
+      // do not update when the active editor is an output channel
       return;
     }
 
-    const fileContext = await getFileContextFromSelection(editor, this.gitProvider);
-    await this.client?.updateActiveSelection(fileContext);
+    if (!editor || !isValidForSyncActiveEditorSelection(editor)) {
+      await this.client?.["0.8.0"].updateActiveSelection(null);
+      return;
+    }
+
+    const fileContext = await getEditorContext(editor, this.gitProvider);
+    await this.client?.["0.8.0"].updateActiveSelection(fileContext);
   }
+
+  private debouncedNotifyActiveEditorSelectionChange = debounce(async (editor: TextEditor | undefined) => {
+    await this.notifyActiveEditorSelectionChange(editor);
+  }, 100);
+
+  private listFiles = wrapCancelableFunction(
+    listFiles,
+    (args) => args[2],
+    (args, token) => {
+      args[2] = token;
+      return args;
+    },
+  );
 
   private getColorThemeString() {
     switch (window.activeColorTheme.kind) {

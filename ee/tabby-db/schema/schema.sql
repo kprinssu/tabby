@@ -63,7 +63,8 @@ CREATE TABLE server_setting(
   security_disable_client_side_telemetry BOOLEAN NOT NULL DEFAULT FALSE,
   network_external_url STRING NOT NULL DEFAULT 'http://localhost:8080'
   ,
-  billing_enterprise_license STRING
+  billing_enterprise_license STRING,
+  security_disable_password_login BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE TABLE email_setting(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,14 +176,10 @@ CREATE TABLE thread_messages(
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   -- Array of code attachments, in format of `ThreadMessageAttachmentCode`
-  code_attachments BLOB,
-  -- Array of client code attachments, in format of `ThreadMessageAttachmentClientCode`
-  client_code_attachments BLOB,
-  -- Array of doc attachments, in format of `ThreadMessageAttachmentDoc`
-  doc_attachments BLOB,
   created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   code_source_id VARCHAR(255),
+  attachment BLOB NOT NULL DEFAULT '{}',
   FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
 CREATE TABLE web_documents(
@@ -260,4 +257,44 @@ CREATE TABLE ldap_credential(
   name_attribute STRING,
   created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now'))
+);
+CREATE TABLE IF NOT EXISTS "pages"(
+  id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+  author_id integer NOT NULL,
+  title text,
+  content text,
+  created_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  updated_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  code_source_id VARCHAR(255),
+  FOREIGN KEY(author_id) REFERENCES "users"(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS "page_sections"(
+  id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+  page_id integer NOT NULL,
+  title text NOT NULL,
+  content text,
+  "position" integer NOT NULL,
+  created_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  updated_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  attachment BLOB NOT NULL DEFAULT '{}',
+  FOREIGN KEY(page_id) REFERENCES "pages"(id) ON DELETE CASCADE,
+  UNIQUE(page_id, "position")
+);
+CREATE TABLE ingested_documents(
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  -- User-provided document source
+  source TEXT NOT NULL,
+  -- User-provided document ID, unique within the same source
+  doc_id TEXT NOT NULL,
+  link TEXT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  -- Track progress of ingestion
+  status TEXT NOT NULL CHECK(status IN('pending', 'indexed', 'failed')),
+  -- Expiration time in Unix timestamp(0 means never expired, should be cleaned by API)
+  expired_at INTEGER NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- Enforce unique constraint on(source, doc_id) to ensure document IDs are unique within the same source
+  UNIQUE(source, doc_id)
 );

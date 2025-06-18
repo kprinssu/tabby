@@ -14,7 +14,7 @@ import { InlineCompletionParams } from "vscode-languageclient";
 import { InlineCompletionRequest, InlineCompletionList, EventParams } from "tabby-agent";
 import { EventEmitter } from "events";
 import { getLogger } from "./logger";
-import { Client } from "./lsp/Client";
+import { Client } from "./lsp/client";
 import { Config } from "./Config";
 
 interface DisplayedCompletion {
@@ -60,6 +60,13 @@ export class InlineCompletionProvider extends EventEmitter implements InlineComp
 
     if (context.triggerKind === InlineCompletionTriggerKind.Automatic && this.triggerMode === "manual") {
       this.logger.debug("Skip automatic trigger when triggerMode is manual.");
+      return null;
+    }
+
+    // Skip if the current language is disabled
+    const currentLanguage = document.languageId;
+    if (this.config.disabledLanguages.includes(currentLanguage)) {
+      this.logger.debug(`Skipping completion for disabled language: ${currentLanguage}`);
       return null;
     }
 

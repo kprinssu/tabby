@@ -1,8 +1,13 @@
 import React, { forwardRef, useEffect, useState } from 'react'
 import { isNil } from 'lodash-es'
+import { TerminalContext } from 'tabby-chat-panel/index'
 
-import { RelevantCodeContext } from '@/lib/types'
-import { cn, resolveFileNameForDisplay } from '@/lib/utils'
+import { RelevantCodeContext, ServerFileContext } from '@/lib/types'
+import {
+  cn,
+  resolveDirectoryPath,
+  resolveFileNameForDisplay
+} from '@/lib/utils'
 import {
   Tooltip,
   TooltipContent,
@@ -15,7 +20,12 @@ import {
   AccordionItem,
   AccordionTrigger
 } from '../ui/accordion'
-import { IconExternalLink, IconFile, IconFileSearch2 } from '../ui/icons'
+import {
+  IconExternalLink,
+  IconFile,
+  IconFileSearch2,
+  IconTerminalSquare
+} from '../ui/icons'
 
 interface ContextReferencesProps {
   supportsOpenInEditor?: boolean
@@ -32,6 +42,7 @@ interface ContextReferencesProps {
   highlightIndex?: number | undefined
   showExternalLink: boolean
   showClientCodeIcon: boolean
+  title?: React.ReactNode
 }
 
 export const CodeReferences = forwardRef<
@@ -50,15 +61,15 @@ export const CodeReferences = forwardRef<
       highlightIndex,
       showExternalLink,
       showClientCodeIcon,
-      supportsOpenInEditor
+      supportsOpenInEditor,
+      title
     },
     ref
   ) => {
-    const totalContextLength = (clientContexts?.length || 0) + contexts.length
-    const isMultipleReferences = totalContextLength > 1
     const serverCtxLen = contexts?.length ?? 0
     const clientCtxLen = clientContexts?.length ?? 0
     const ctxLen = serverCtxLen + clientCtxLen
+    const isMultipleReferences = ctxLen > 1
     const [accordionValue, setAccordionValue] = useState<string | undefined>(
       ctxLen <= 5 ? 'references' : undefined
     )
@@ -70,7 +81,7 @@ export const CodeReferences = forwardRef<
       }
     }, [ctxLen])
 
-    if (totalContextLength === 0) return null
+    if (!ctxLen) return null
 
     return (
       <Accordion
@@ -83,16 +94,31 @@ export const CodeReferences = forwardRef<
       >
         <AccordionItem value="references" className="my-0 border-0">
           <AccordionTrigger
-            className={cn('my-0 py-2 font-semibold', triggerClassname)}
+            className={cn(
+              'my-0 py-2 font-semibold outline-none focus-visible:ring-1 focus-visible:ring-ring',
+              triggerClassname
+            )}
           >
-            <span className="mr-2">{`Read ${totalContextLength} file${
-              isMultipleReferences ? 's' : ''
-            }`}</span>
+            {title ? (
+              title
+            ) : (
+              <span className="mr-2">{`Read ${ctxLen} file${
+                isMultipleReferences ? 's' : ''
+              }`}</span>
+            )}
           </AccordionTrigger>
           <AccordionContent className="space-y-2">
             {clientContexts?.map((item, index) => {
+              if (item.kind === 'terminal') {
+                return (
+                  <TerminalContextItem
+                    key={`client-terminal-${index}`}
+                    context={item}
+                  />
+                )
+              }
               return (
-                <ContextItem
+                <FileContextItem
                   key={`user-${index}`}
                   context={item}
                   onContextClick={ctx => onContextClick?.(ctx, true)}
@@ -103,8 +129,16 @@ export const CodeReferences = forwardRef<
               )
             })}
             {contexts.map((item, index) => {
+              if (item.kind === 'terminal') {
+                return (
+                  <TerminalContextItem
+                    key={`terminal-${index}`}
+                    context={item}
+                  />
+                )
+              }
               return (
-                <ContextItem
+                <FileContextItem
                   key={`assistant-${index}`}
                   context={item}
                   onContextClick={ctx => onContextClick?.(ctx, false)}
@@ -125,7 +159,7 @@ export const CodeReferences = forwardRef<
 )
 CodeReferences.displayName = 'CodeReferences'
 
-function ContextItem({
+function FileContextItem({
   context,
   clickable = true,
   onContextClick,
@@ -135,7 +169,7 @@ function ContextItem({
   showClientCodeIcon,
   isHighlighted
 }: {
-  context: RelevantCodeContext
+  context: ServerFileContext
   clickable?: boolean
   onContextClick?: (context: RelevantCodeContext) => void
   enableTooltip?: boolean
@@ -150,8 +184,7 @@ function ContextItem({
     !isNil(context.range?.start) &&
     !isNil(context.range?.end) &&
     context.range.start < context.range.end
-  const pathSegments = context.filepath.split('/')
-  const path = pathSegments.slice(0, pathSegments.length - 1).join('/')
+  const path = resolveDirectoryPath(context.filepath)
   const scores = context?.extra?.scores
   const onTooltipOpenChange = (v: boolean) => {
     if (!enableTooltip || !scores) return
@@ -227,5 +260,20 @@ function ContextItem({
         </div>
       </TooltipContent>
     </Tooltip>
+  )
+}
+
+const TerminalContextItem: React.FC<{ context: TerminalContext }> = ({
+  context
+}) => {
+  return (
+    <div className="rounded-md border p-2">
+      <div className="flex items-center gap-1 overflow-hidden">
+        <IconTerminalSquare className="shrink-0" />
+        <div className="flex-1 truncate" title={context.selection}>
+          <span>{context.name ?? 'Terminal Selection'}</span>
+        </div>
+      </div>
+    </div>
   )
 }

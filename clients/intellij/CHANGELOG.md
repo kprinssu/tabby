@@ -1,3 +1,47 @@
+## 1.13.0
+
+### Features
+
+- **Chat**:
+  - Requires Tabby Server 0.27.0 or later.
+  - You can now select code in the editor and use the `Code Review` option from the context menu to review your code and add comments using Tabby Chat.
+
+## 1.12.0
+
+### Features
+
+- **Chat**:
+  - Requires connecting to a Tabby server version 0.26.0 or later.
+  - Added support to view recent chat history in the chat panel.
+- Added an action `Generate Commit Message` in the `Git` menu to generate a commit message based on the current changes.
+
+## 1.11.0
+
+### Features
+
+- **Chat**:
+  - Requires connecting to a Tabby server version 0.25.0 or later.
+  - Now uses the active editor as context by default.
+
+### Fixes & Improvements
+
+- Optimized the display of file paths in the chat panel.
+
+## 1.10.1
+
+### Fixes & Improvements
+
+- Reduced the use of read locks to prevent UI freezing issues when collecting declaration code snippets for code completion.
+
+## 1.10.0
+
+### Features
+
+- **Chat**:
+  - Added support to explicitly select a configured Git repository as the context for chat conversations.
+  - Added support to use the active editor selection as the context for chat conversations.
+  - **Note**: Requires updating the Tabby server to version 0.23.0 or later.
+
 ## 1.9.1
 
 ### Fixes & Improvements

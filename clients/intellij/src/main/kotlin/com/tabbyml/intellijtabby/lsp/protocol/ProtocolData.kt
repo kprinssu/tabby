@@ -48,9 +48,12 @@ data class TextDocumentClientCapabilities(
   val synchronization: SynchronizationCapabilities? = null,
   val completion: CompletionCapabilities? = null,
   val inlineCompletion: InlineCompletionCapabilities? = null,
+  var codeLens: CodeLensCapabilities ? = null,
 )
 
-typealias InlineCompletionCapabilities = DynamicRegistrationCapabilities
+data class InlineCompletionCapabilities(
+  val dynamicRegistration: Boolean? = null,
+)
 
 data class TabbyClientCapabilities(
   val configDidChangeListener: Boolean? = null,
@@ -199,7 +202,7 @@ data class EventParams(
    * [SelectKind]
    */
   val selectKind: String? = null,
-  val eventId: CompletionEventId? = null,
+  val eventId: CompletionEventId,
   val viewId: String? = null,
   val elapsed: Int? = null,
 ) {
@@ -346,3 +349,37 @@ data class EditorOptionsParams(
 data class EditorOptions(
   val indentation: String? = null,
 )
+
+data class GenerateCommitMessageParams(
+  val repository: String,
+)
+
+data class GenerateCommitMessageResult(
+  val commitMessage: String,
+)
+
+data class ChatEditParams(
+  val location: Location,
+  val command: String,
+  val format: String = "previewChanges",
+  val context: List<ChatEditFileContext>? = null,
+)
+
+data class ChatEditFileContext(
+  val referrer: String,
+  val uri: String,
+  val range: Range,
+)
+
+data class ChatEditResolveParams(
+  val location: Location,
+  var action: String,
+)
+
+data class ChatEditCommandParams(var location: Location)
+
+data class ChatEditCommand(var label: String, var command: String, var source: String = "preset" )
+
+data class TabbyApplyWorkspaceEditOptions(val undoStopBefore: Boolean = false, val undoStopAfter: Boolean = false)
+
+data class TabbyApplyWorkspaceEditParams(val label: String?, val edit: WorkspaceEdit, val options: TabbyApplyWorkspaceEditOptions? = null)

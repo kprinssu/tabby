@@ -37,12 +37,14 @@ import com.tabbyml.tabby4eclipse.lsp.protocol.GitRepositoryParams;
 public class ChatViewUtils {
 	private static final String ID = "com.tabbyml.tabby4eclipse.views.chat";
 
-	private static final String MIN_SERVER_VERSION = "0.18.0";
-	private static final String CHAT_PANEL_API_VERSION = "0.5.0";
+	private static final String MIN_SERVER_VERSION = "0.27.0";
 	private static Logger logger = new Logger("ChatView");
 
 	private static final Gson gson = new Gson();
 	private static final Map<String, String> gitRemoteUrlToLocalRoot = new HashMap<>();
+
+	public static final String API_0_8_0 = "0.8.0";
+	public static final String API_0_9_0 = "0.9.0";
 
 	public static ChatView openChatView() {
 		IWorkbenchPage page = EditorUtils.getActiveWorkbenchPage();
@@ -88,7 +90,7 @@ public class ChatViewUtils {
 			if (version != null) {
 				Version parsedVersion = new Version(version);
 				Version requiredVersion = new Version(MIN_SERVER_VERSION);
-				if (!parsedVersion.isGreaterOrEqualThan(requiredVersion)) {
+				if (!parsedVersion.isZero() && !parsedVersion.isGreaterOrEqualThan(requiredVersion)) {
 					return String.format(
 							"Tabby Chat requires Tabby server version %s or later. Your server is running version %s.",
 							MIN_SERVER_VERSION, version);
@@ -98,46 +100,51 @@ public class ChatViewUtils {
 		return null;
 	}
 
-	public static String checkChatPanelApiVersion(String version) {
-		Version parsedVersion = new Version(version);
-		Version requiredVersion = new Version(CHAT_PANEL_API_VERSION);
-		if (!parsedVersion.isEqual(requiredVersion, true)) {
-			return "Please update your Tabby server and Tabby plugin for Eclipse to the latest version to use chat panel.";
-		}
-		return null;
+	// default: use selection if available, otherwise use the whole file
+	// selection: use selection if available, otherwise return null
+	// file: use the whole file
+	public static enum RangeStrategy {
+		DEFAULT, SELECTION, FILE
 	}
 
-	public static EditorFileContext getSelectedTextAsEditorFileContext() {
+	public static EditorFileContext getActiveEditorFileContext() {
+		return getActiveEditorFileContext(RangeStrategy.DEFAULT);
+	}
+
+	public static EditorFileContext getActiveEditorFileContext(RangeStrategy rangeStrategy) {
 		ITextEditor activeTextEditor = EditorUtils.getActiveTextEditor();
 		if (activeTextEditor == null) {
 			return null;
 		}
 		IFile file = ResourceUtil.getFile(activeTextEditor.getEditorInput());
-		URI fileUri = file.getLocationURI();
 		ISelection selection = activeTextEditor.getSelectionProvider().getSelection();
+		boolean hasSelection = false;
 		if (selection instanceof ITextSelection textSelection) {
 			if (!textSelection.isEmpty()) {
 				String content = textSelection.getText();
 				if (!content.isBlank()) {
-					return new EditorFileContext(fileUriToChatPanelFilepath(fileUri),
-							new LineRange(textSelection.getStartLine() + 1, textSelection.getEndLine() + 1), content);
+					hasSelection = true;
 				}
 			}
 		}
-		return null;
-	}
 
-	public static EditorFileContext getActiveEditorAsEditorFileContext() {
-		ITextEditor activeTextEditor = EditorUtils.getActiveTextEditor();
-		if (activeTextEditor == null) {
-			return null;
-		}
-		IFile file = ResourceUtil.getFile(activeTextEditor.getEditorInput());
-		URI fileUri = file.getLocationURI();
-		IDocument document = EditorUtils.getDocument(activeTextEditor);
-		String content = document.get();
-		if (!content.isBlank()) {
-			return new EditorFileContext(fileUriToChatPanelFilepath(fileUri), null, content);
+		if (rangeStrategy == RangeStrategy.SELECTION || (rangeStrategy == RangeStrategy.DEFAULT && hasSelection)) {
+			if (selection instanceof ITextSelection textSelection) {
+				if (!textSelection.isEmpty()) {
+					String content = textSelection.getText();
+					if (!content.isBlank()) {
+						return new EditorFileContext(fileToChatPanelFilepath(file),
+								new LineRange(textSelection.getStartLine() + 1, textSelection.getEndLine() + 1),
+								content);
+					}
+				}
+			}
+		} else {
+			IDocument document = EditorUtils.getDocument(activeTextEditor);
+			String content = document.get();
+			if (!content.isBlank()) {
+				return new EditorFileContext(fileToChatPanelFilepath(file), null, content);
+			}
 		}
 		return null;
 	}
@@ -147,32 +154,8 @@ public class ChatViewUtils {
 			return false;
 		}
 		Filepath filepath = fileLocation.getFilepath();
-		URI fileUri = null;
 		try {
-			switch (filepath.getKind()) {
-			case Filepath.Kind.URI:
-				FilepathUri filepathUri = (FilepathUri) filepath;
-				fileUri = new URI(filepathUri.getUri());
-				break;
-
-			case Filepath.Kind.GIT:
-				FilepathInGitRepository filepathInGit = (FilepathInGitRepository) filepath;
-				String gitLocalRoot = gitRemoteUrlToLocalRoot.get(filepathInGit.getGitUrl());
-				if (gitLocalRoot != null) {
-					fileUri = new URI(gitLocalRoot + "/" + filepathInGit.getFilepath());
-				}
-				break;
-
-			default:
-				fileUri = null;
-				break;
-			}
-
-			if (fileUri == null) {
-				throw new Exception("Cannot parse as file uri.");
-			}
-
-			IFile file = ResourcesPlugin.getWorkspace().getRoot().getFileForLocation(new Path(fileUri.getPath()));
+			IFile file = chatPanelFilepathToFile(filepath);
 			if (file != null && file.exists()) {
 				IEditorPart editorPart = IDE.openEditor(EditorUtils.getActiveWorkbenchPage(), file);
 
@@ -212,24 +195,25 @@ public class ChatViewUtils {
 	public static void openExternal(String url) {
 		Program.launch(url);
 	}
-	
+
 	public static List<GitRepository> readGitRepositoriesInWorkspace() {
 		List<GitRepository> repositories = new ArrayList<>();
-        IWorkspaceRoot workspaceRoot = ResourcesPlugin.getWorkspace().getRoot();
-        IProject[] projects = workspaceRoot.getProjects();
-        
-        for (IProject project : projects) {
-        	try {
-        		URI projectRootUri = project.getLocation().toFile().toURI();
-                com.tabbyml.tabby4eclipse.lsp.protocol.GitRepository repo = GitProvider.getInstance().getRepository(new GitRepositoryParams(projectRootUri.toString()));
-                if (repo != null) {
-                	repositories.add(new GitRepository(repo.getRemoteUrl()));
-                }
-            } catch (Exception e) {
-                logger.warn("Error when read git repository.", e);
-            }
-        }
-        return repositories;
+		IWorkspaceRoot workspaceRoot = ResourcesPlugin.getWorkspace().getRoot();
+		IProject[] projects = workspaceRoot.getProjects();
+
+		for (IProject project : projects) {
+			try {
+				URI projectRootUri = project.getLocation().toFile().toURI();
+				com.tabbyml.tabby4eclipse.lsp.protocol.GitRepository repo = GitProvider.getInstance()
+						.getRepository(new GitRepositoryParams(projectRootUri.toString()));
+				if (repo != null) {
+					repositories.add(new GitRepository(repo.getRemoteUrl()));
+				}
+			} catch (Exception e) {
+				logger.warn("Error when read git repository.", e);
+			}
+		}
+		return repositories;
 	}
 
 	public static void setClipboardContent(String content) {
@@ -259,24 +243,108 @@ public class ChatViewUtils {
 		}
 	}
 
-	public static Filepath fileUriToChatPanelFilepath(URI fileUri) {
+	public static Filepath fileToChatPanelFilepath(IFile file) {
+		if (file == null) {
+			return null;
+		}
+		URI fileUri = file.getLocationURI();
 		String fileUriString = fileUri.toString();
-        com.tabbyml.tabby4eclipse.lsp.protocol.GitRepository gitRepo = GitProvider.getInstance().getRepository(new GitRepositoryParams(fileUriString));
+
+		com.tabbyml.tabby4eclipse.lsp.protocol.GitRepository gitRepo = GitProvider.getInstance()
+				.getRepository(new GitRepositoryParams(fileUriString));
 		String gitUrl = (gitRepo != null) ? gitRepo.getRemoteUrl() : null;
 		if (gitUrl != null) {
 			gitRemoteUrlToLocalRoot.put(gitUrl, gitRepo.getRoot());
 		}
-
 		if (gitUrl != null && fileUriString.startsWith(gitRepo.getRoot())) {
 			try {
 				String relativePath = new URI(gitRepo.getRoot()).relativize(fileUri).getPath();
 				return new FilepathInGitRepository(relativePath, gitUrl);
-			} catch (URISyntaxException e) {
-				return new FilepathUri(fileUriString);
+			} catch (Exception e) {
+				// nothing
 			}
-		} else {
-			return new FilepathUri(fileUriString);
 		}
+
+		IWorkspaceRoot workspaceRoot = ResourcesPlugin.getWorkspace().getRoot();
+		IProject[] projects = workspaceRoot.getProjects();
+		for (IProject project : projects) {
+			try {
+				URI projectRootUri = project.getLocation().toFile().toURI();
+				String projectRootUriString = projectRootUri.toString();
+				if (fileUriString.startsWith(projectRootUriString)) {
+					String relativePath = projectRootUri.relativize(fileUri).getPath();
+					return new FilepathInWorkspace(relativePath, projectRootUriString);
+				}
+			} catch (Exception e) {
+				// nothing
+			}
+		}
+
+		return new FilepathUri(fileUriString);
+	}
+
+	public static IFile chatPanelFilepathToFile(Filepath filepath) {
+		IWorkspaceRoot workspaceRoot = ResourcesPlugin.getWorkspace().getRoot();
+
+		switch (filepath.getKind()) {
+		case Filepath.Kind.URI: {
+			FilepathUri filepathUri = (FilepathUri) filepath;
+			try {
+				URI fileUri = new URI(filepathUri.getUri());
+				IFile file = workspaceRoot.getFileForLocation(new Path(fileUri.getPath()));
+				if (file != null && file.exists()) {
+					return file;
+				}
+			} catch (URISyntaxException e) {
+				IProject[] projects = workspaceRoot.getProjects();
+				for (IProject project : projects) {
+					URI projectRootUri = project.getLocation().toFile().toURI();
+					URI fileUri = projectRootUri.resolve(filepathUri.getUri());
+					IFile file = workspaceRoot.getFileForLocation(new Path(fileUri.getPath()));
+					if (file != null && file.exists()) {
+						return file;
+					}
+				}
+			}
+			break;
+		}
+
+		case Filepath.Kind.WORKSPACE: {
+			FilepathInWorkspace filepathInWorkspace = (FilepathInWorkspace) filepath;
+			try {
+				URI fileUri = new URI(filepathInWorkspace.getBaseDir()).resolve(filepathInWorkspace.getFilepath());
+				IFile file = workspaceRoot.getFileForLocation(new Path(fileUri.getPath()));
+				if (file != null && file.exists()) {
+					return file;
+				}
+			} catch (Exception e) {
+				// nothing
+			}
+			break;
+		}
+
+		case Filepath.Kind.GIT:
+			FilepathInGitRepository filepathInGit = (FilepathInGitRepository) filepath;
+			String gitLocalRoot = gitRemoteUrlToLocalRoot.get(filepathInGit.getGitUrl());
+			if (gitLocalRoot != null) {
+				try {
+					URI fileUri = new URI(gitLocalRoot).resolve(filepathInGit.getFilepath());
+					IFile file = workspaceRoot.getFileForLocation(new Path(fileUri.getPath()));
+					if (file != null && file.exists()) {
+						return file;
+					}
+				} catch (Exception e) {
+					// nothing
+				}
+			}
+			break;
+
+		default:
+			break;
+		}
+
+		logger.warn("Failed to parse filepath: " + gson.toJson(filepath));
+		return null;
 	}
 
 	public static FileLocation asFileLocation(Object obj) {
@@ -299,6 +367,8 @@ public class ChatViewUtils {
 				String kind = (String) filepathMap.get("kind");
 				if (Filepath.Kind.GIT.equals(kind)) {
 					filepath = gson.fromJson(gson.toJson(filepathValue), FilepathInGitRepository.class);
+				} else if (Filepath.Kind.WORKSPACE.equals(kind)) {
+					filepath = gson.fromJson(gson.toJson(filepathValue), FilepathInWorkspace.class);
 				} else if (Filepath.Kind.URI.equals(kind)) {
 					filepath = gson.fromJson(gson.toJson(filepathValue), FilepathUri.class);
 				}

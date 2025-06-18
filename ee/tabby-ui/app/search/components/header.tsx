@@ -5,9 +5,9 @@ import type { MouseEvent } from 'react'
 import { useRouter } from 'next/navigation'
 import { toast } from 'sonner'
 
-import { graphql } from '@/lib/gql/generates'
 import { clearHomeScrollPosition } from '@/lib/stores/scroll-store'
 import { useMutation } from '@/lib/tabby/gql'
+import { deleteThreadMutation } from '@/lib/tabby/query'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,13 +16,22 @@ import {
   AlertDialogDescription,
   AlertDialogFooter,
   AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger
+  AlertDialogTitle
 } from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
+import {
+  IconBookOpen,
   IconChevronLeft,
+  IconMore,
   IconPlus,
+  IconShare,
   IconSpinner,
   IconTrash
 } from '@/components/ui/icons'
@@ -34,18 +43,21 @@ import UserPanel from '@/components/user-panel'
 
 import { SearchContext } from './search-context'
 
-const deleteThreadMutation = graphql(/* GraphQL */ `
-  mutation DeleteThread($id: ID!) {
-    deleteThread(id: $id)
-  }
-`)
-
 type HeaderProps = {
   threadIdFromURL?: string
   streamingDone?: boolean
+  threadId?: string
+  onConvertToPage?: () => void
+  onShare?: () => void
 }
 
-export function Header({ threadIdFromURL, streamingDone }: HeaderProps) {
+export function Header({
+  threadIdFromURL,
+  streamingDone,
+  threadId,
+  onConvertToPage,
+  onShare
+}: HeaderProps) {
   const router = useRouter()
   const { isThreadOwner } = useContext(SearchContext)
   const [deleteAlertVisible, setDeleteAlertVisible] = useState(false)
@@ -67,10 +79,12 @@ export function Header({ threadIdFromURL, streamingDone }: HeaderProps) {
   })
 
   const handleDeleteThread = (e: MouseEvent<HTMLButtonElement>) => {
+    if (!threadId) return
+
     e.preventDefault()
     setIsDeleting(true)
     deleteThread({
-      id: threadIdFromURL!
+      id: threadId
     })
   }
 
@@ -97,44 +111,55 @@ export function Header({ threadIdFromURL, streamingDone }: HeaderProps) {
         {streamingDone && threadIdFromURL && (
           <Button
             variant="ghost"
-            className="flex items-center gap-1 px-2 font-normal text-muted-foreground"
+            className="flex items-center gap-1 px-2 font-normal"
             onClick={() => onNavigateToHomePage(true)}
           >
             <IconPlus />
           </Button>
         )}
-        {streamingDone && threadIdFromURL && isThreadOwner && (
-          <AlertDialog
-            open={deleteAlertVisible}
-            onOpenChange={setDeleteAlertVisible}
-          >
-            <AlertDialogTrigger asChild>
-              <Button size="icon" variant="hover-destructive">
-                <IconTrash />
+        {streamingDone && threadId && (
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <Button size="icon" variant="ghost">
+                <IconMore />
               </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete this thread</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Are you sure you want to delete this thread? This operation is
-                  not revertible.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  className={buttonVariants({ variant: 'destructive' })}
-                  onClick={handleDeleteThread}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {!!onShare && (
+                <DropdownMenuItem
+                  className="cursor-pointer gap-2"
+                  onSelect={e => onShare()}
                 >
-                  {isDeleting && (
-                    <IconSpinner className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Yes, delete it
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+                  <IconShare />
+                  Share
+                </DropdownMenuItem>
+              )}
+              {isThreadOwner && (
+                <>
+                  <DropdownMenuItem
+                    className="cursor-pointer gap-2"
+                    onSelect={e => onConvertToPage?.()}
+                  >
+                    <IconBookOpen />
+                    <span>Convert to page</span>
+                    <Badge
+                      variant="outline"
+                      className="h-3.5 border-secondary-foreground/60 px-1.5 text-[10px] text-secondary-foreground/60"
+                    >
+                      Beta
+                    </Badge>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="cursor-pointer gap-2 !text-destructive"
+                    onSelect={e => setDeleteAlertVisible(true)}
+                  >
+                    <IconTrash />
+                    Delete
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <ClientOnly>
           <ThemeToggle />
@@ -150,6 +175,32 @@ export function Header({ threadIdFromURL, streamingDone }: HeaderProps) {
           <MyAvatar className="h-10 w-10 border" />
         </UserPanel>
       </div>
+      <AlertDialog
+        open={deleteAlertVisible}
+        onOpenChange={setDeleteAlertVisible}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this thread</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete this thread? This operation is not
+              revertible.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className={buttonVariants({ variant: 'destructive' })}
+              onClick={handleDeleteThread}
+            >
+              {isDeleting && (
+                <IconSpinner className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Yes, delete it
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </header>
   )
 }
